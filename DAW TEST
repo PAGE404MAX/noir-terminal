@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Nill (open source) | Professional Wavetable Synthesizer
-Terminal DAW with FL Studio-like Features, Advanced Piano Roll, Audio Engine, and Command Terminal
 """
 
 import sys
