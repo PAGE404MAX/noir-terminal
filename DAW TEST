@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Nill (open source) | Professional Wavetable Synthesizer
+Terminal DAW with FL Studio-like Features, Advanced Piano Roll, Audio Engine, and Command Terminal
 """
 
 import sys
@@ -96,12 +97,14 @@ class PolyphonicSynth:
         
         # OSC 1 Parameters
         self.osc1_wave = 'sine'
+        self.osc1_wt_pos = 0.0
         self.osc1_detune = 0.0
         self.osc1_level = 1.0
         self.osc1_phase = 0.0
         
         # OSC 2 Parameters
         self.osc2_wave = 'saw'
+        self.osc2_wt_pos = 0.0
         self.osc2_detune = 0.0
         self.osc2_level = 0.0
         self.osc2_phase = 0.0
@@ -153,6 +156,13 @@ class PolyphonicSynth:
                 self.osc1_phase = value
             elif osc == 2:
                 self.osc2_phase = value
+
+    def set_osc_wt_pos(self, osc: int, value: float) -> None:
+        with self._lock:
+            if osc == 1:
+                self.osc1_wt_pos = value
+            elif osc == 2:
+                self.osc2_wt_pos = value
 
     def note_on(self, midi_note: int) -> None:
         with self._lock:
@@ -244,16 +254,22 @@ class PolyphonicSynth:
             buffer = output
         return buffer
 
-    def _generate_wave(self, phases: np.ndarray, wave_type: str) -> np.ndarray:
-        if wave_type == 'sine':
-            return np.sin(2 * np.pi * phases)
-        elif wave_type == 'square':
-            return np.where(phases < 0.5, 1.0, -1.0)
-        elif wave_type == 'saw':
-            return 2 * (phases - 0.5)
-        elif wave_type == 'triangle':
-            return 2 * np.abs(2 * (phases - 0.5)) - 1
-        return np.sin(2 * np.pi * phases)
+    def _generate_wave(self, phases: np.ndarray, wt_pos: float) -> np.ndarray:
+        pos = wt_pos * 3.0
+        idx1 = int(np.floor(pos))
+        idx2 = min(3, idx1 + 1)
+        frac = pos - idx1
+        
+        def get_frame(idx, p):
+            if idx == 0: return np.sin(2 * np.pi * p)
+            elif idx == 1: return 2 * np.abs(2 * (p - 0.5)) - 1
+            elif idx == 2: return 2 * (p - 0.5)
+            elif idx == 3: return np.where(p < 0.5, 1.0, -1.0)
+            return np.sin(2 * np.pi * p)
+            
+        frame1 = get_frame(idx1, phases)
+        frame2 = get_frame(idx2, phases)
+        return frame1 * (1.0 - frac) + frame2 * frac
 
     def generate_audio(self, num_samples: int) -> np.ndarray:
         buffer = np.zeros(num_samples, dtype=np.float32)
@@ -291,11 +307,15 @@ class PolyphonicSynth:
                 phases1 = (phase1 / (np.pi * 2) + (freq1 / self.sample_rate) * t) % 1.0
                 phases2 = (phase2 / (np.pi * 2) + (freq2 / self.sample_rate) * t) % 1.0
                 
-                wave1 = self.waveform_type if self.use_global_waveform else self.osc1_wave
-                wave2 = self.waveform_type if self.use_global_waveform else self.osc2_wave
+                pos1 = self.osc1_wt_pos
+                pos2 = self.osc2_wt_pos
+                if self.use_global_waveform:
+                    mapping = {'sine': 0.0, 'triangle': 0.333, 'saw': 0.666, 'square': 1.0}
+                    pos1 = mapping.get(self.waveform_type, 0.0)
+                    pos2 = mapping.get(self.waveform_type, 0.0)
                 
-                osc1 = self._generate_wave(phases1, wave1)
-                osc2 = self._generate_wave(phases2, wave2)
+                osc1 = self._generate_wave(phases1, pos1)
+                osc2 = self._generate_wave(phases2, pos2)
                 
                 mix = (osc1 * self.osc1_level) + (osc2 * self.osc2_level)
                 env_array = np.linspace(prev_envelope, envelope, num_samples)
@@ -681,6 +701,8 @@ class SerumApp:
         for wave, btn in self._waveform_btns.items():
             btn.config(bg=FG_BRIGHT if wave == waveform else BORDER, 
                       fg=BG_BLACK if wave == waveform else FG_DIM)
+        if hasattr(self, '_update_wt_canvas'):
+            self._update_wt_canvas()
 
     def _cycle_waveform(self, direction: int):
         self._waveform_index = (self._waveform_index + direction) % len(WAVEFORMS)
@@ -706,7 +728,7 @@ class SerumApp:
         wt_canvas = tk.Canvas(sec, width=280, height=50, bg=BG_BLACK, 
                              highlightthickness=1, highlightbackground=BORDER)
         wt_canvas.pack(pady=(0, 8))
-        self._wt_canvases.append((wt_canvas, wave_type, 2.0))
+        self._wt_canvases.append((wt_canvas, osc_num, 2.0))
         
         # Waveform buttons
         wave_frame = tk.Frame(sec, bg=BG_BLACK)
@@ -726,6 +748,7 @@ class SerumApp:
         knob_frame = tk.Frame(sec, bg=BG_BLACK)
         knob_frame.pack(fill='x')
         for i, (lbl, init, min_v, max_v, fmt, param) in enumerate([
+            ('WTP', 0.0, 0.0, 1.0, lambda v: f'{int(v*100)}%', 'wt_pos'),
             ('DET', 0.5, 0.0, 1.0, lambda v: f'{int((v-0.5)*100):+d}', 'detune'),
             ('LEV', 1.0 if osc_num == 1 else 0.0, 0.0, 1.0, lambda v: f'{int(v*100)}%', 'level'),
             ('PHS', 0.0, 0.0, 1.0, lambda v: f'{int(v*360)}°', 'phase')
@@ -744,9 +767,18 @@ class SerumApp:
     def _set_osc_wave(self, osc_num, waveform):
         self.synth.use_global_waveform = False
         self.synth.set_osc_wave(osc_num, waveform)
+        mapping = {'sine': 0.0, 'triangle': 0.333, 'saw': 0.666, 'square': 1.0}
+        self.synth.set_osc_wt_pos(osc_num, mapping.get(waveform, 0.0))
+        # Find the WT POS knob and update it
+        # Actually it's easier to just call _update_wt_canvas for now
+        self._update_wt_canvas()
     
     def _on_osc_change(self, osc_num, param, value, label):
-        if param == 'detune':
+        if param == 'wt_pos':
+            label.config(text=f'{int(value*100)}%')
+            self.synth.set_osc_wt_pos(osc_num, value)
+            self._update_wt_canvas()
+        elif param == 'detune':
             label.config(text=f'{int((value-0.5)*100):+d}')
             self.synth.set_osc_detune(osc_num, int((value - 0.5) * 100))
         elif param == 'level':
@@ -922,25 +954,29 @@ class SerumApp:
                 self.piano_keyboard.highlight_key(midi_note, False)
 
     def _init_mini_waves(self):
-        for canvas, wtype, freq in self._wt_canvases:
+        self._update_wt_canvas()
+
+    def _update_wt_canvas(self):
+        for canvas, osc_num, freq in self._wt_canvases:
             canvas.delete('all')
             canvas.configure(bg=BG_BLACK)
             w = canvas.winfo_width() or 280
             h = canvas.winfo_height() or 50
             for i in range(5):
                 canvas.create_line(0, int(h / 4 * i), w, int(h / 4 * i), fill=BORDER, width=1)
+            
+            wt_pos = self.synth.osc1_wt_pos if osc_num == 1 else self.synth.osc2_wt_pos
+            if self.synth.use_global_waveform:
+                 mapping = {'sine': 0.0, 'triangle': 0.333, 'saw': 0.666, 'square': 1.0}
+                 wt_pos = mapping.get(self.synth.waveform_type, 0.0)
+                 
             pts = []
+            import numpy as np
+            phases = (np.linspace(0, freq, w) % 1.0)
+            wave = self.synth._generate_wave(phases, wt_pos)
             for x in range(w):
-                t = (x / w) * math.pi * 2 * freq
-                if wtype == 'sine':
-                    y = math.sin(t)
-                elif wtype == 'saw':
-                    y = 2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1
-                elif wtype == 'square':
-                    y = 1 if t % (math.pi * 2) < math.pi else -1
-                else:
-                    y = 2 * abs(2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1) - 1
-                pts.extend([x, h / 2 - y * h / 2.5])
+                y = float(h / 2 - wave[x] * (h / 2.5))
+                pts.extend([x, y])
             if len(pts) >= 4:
                 canvas.create_line(pts, fill=FG_WHITE, width=1, smooth=True)
 
@@ -2879,7 +2915,7 @@ def main() -> None:
     
     sys.exit(app.exec())
 
-
+        
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == '--wavetable':
