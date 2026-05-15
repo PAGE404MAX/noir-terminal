@@ -6,4 +6,3 @@ system Identifiers in the UI:
 window title: NODE_0x7F // PARANOIA_UI
 sidebar header: SYSTEM_ROOT
 background noise: Constant "schizo" scrolling of a poem in extremely faint, dark text.
-status logs: Intermittent alerts in the bottom console like THEY_ARE_WATCHING, PACKET_INTERCEPT_SUCCESS, and SIGNAL_DEGRADATION. etc.
