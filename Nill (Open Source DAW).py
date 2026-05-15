@@ -19,18 +19,161 @@ import subprocess
 
 try:
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
+    # ImportError = package missing; OSError = PortAudio missing on the system.
     sd = None
 
 try:
-    from testwavetable import PolyphonicSynth
+    from testwavetable import PolyphonicSynth  # type: ignore
 except Exception:
-    PolyphonicSynth = None
+    PolyphonicSynth = None  # filled in by the built-in fallback below
 
+# winsound is Windows-only; we replace it with a portable sounddevice beep.
 try:
-    import winsound
+    import winsound  # type: ignore
 except ImportError:
     winsound = None
+
+
+# ---------------------------------------------------------------------------
+# Built-in cross-platform polyphonic synth fallback.
+# Used when the optional `testwavetable` module isn't available so that the
+# DAW still produces sound on every OS that has `sounddevice` installed.
+# ---------------------------------------------------------------------------
+class _BuiltInPolyphonicSynth:
+    """A small, dependency-free polyphonic synth with ADSR envelopes."""
+
+    def __init__(self, sample_rate: int = 44100, buffer_size: int = 512):
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
+        # MIDI pitch -> dict(state, env, phase, freq)
+        self._voices: Dict[int, dict] = {}
+        self._lock = threading.Lock()
+        # ADSR (seconds / level)
+        self.attack = 0.005
+        self.decay = 0.10
+        self.sustain = 0.75
+        self.release = 0.20
+        self.gain = 0.22  # master gain to keep things polite
+
+    @staticmethod
+    def _midi_to_freq(pitch: int) -> float:
+        return 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+
+    def note_on(self, pitch: int) -> None:
+        with self._lock:
+            self._voices[pitch] = {
+                "state": "attack",
+                "env": 0.0,
+                "phase": 0.0,
+                "freq": self._midi_to_freq(pitch),
+                "released_at_env": 0.0,
+            }
+
+    def note_off(self, pitch: int) -> None:
+        with self._lock:
+            v = self._voices.get(pitch)
+            if v is not None and v["state"] != "release":
+                v["state"] = "release"
+                v["released_at_env"] = v["env"]
+
+    def all_notes_off(self) -> None:
+        with self._lock:
+            for v in self._voices.values():
+                if v["state"] != "release":
+                    v["state"] = "release"
+                    v["released_at_env"] = v["env"]
+
+    def generate_audio(self, frames: int) -> np.ndarray:
+        out = np.zeros(frames, dtype=np.float32)
+        sr = self.sample_rate
+        dt = 1.0 / sr
+
+        a_step = 1.0 / max(1, int(self.attack * sr))
+        d_step = (1.0 - self.sustain) / max(1, int(self.decay * sr))
+        r_steps = max(1, int(self.release * sr))
+
+        with self._lock:
+            dead = []
+            for pitch, v in self._voices.items():
+                phase = v["phase"]
+                freq = v["freq"]
+                env = v["env"]
+                state = v["state"]
+                released = v["released_at_env"]
+
+                phase_inc = 2.0 * np.pi * freq * dt
+                # Build the waveform sample-by-sample so envelopes track properly.
+                # Mix sine + a soft saw harmonic for some warmth.
+                idx = np.arange(frames)
+                phases = phase + phase_inc * idx
+                # main + 2nd harmonic (a touch) + slight detune
+                wave = (
+                    0.70 * np.sin(phases)
+                    + 0.20 * np.sin(phases * 2.0) * 0.5
+                    + 0.10 * np.sin(phases * 1.005)
+                )
+                v["phase"] = float((phase + phase_inc * frames) % (2.0 * np.pi))
+
+                # Build per-sample envelope
+                envs = np.empty(frames, dtype=np.float32)
+                for i in range(frames):
+                    if state == "attack":
+                        env += a_step
+                        if env >= 1.0:
+                            env = 1.0
+                            state = "decay"
+                    elif state == "decay":
+                        env -= d_step
+                        if env <= self.sustain:
+                            env = self.sustain
+                            state = "sustain"
+                    elif state == "sustain":
+                        pass  # hold
+                    elif state == "release":
+                        # Linear release from released_at_env down to 0
+                        env -= released / r_steps
+                        if env <= 0.0:
+                            env = 0.0
+                    envs[i] = env
+
+                v["env"] = float(env)
+                v["state"] = state
+
+                out += (wave * envs).astype(np.float32)
+
+                if state == "release" and env <= 0.0:
+                    dead.append(pitch)
+
+            for p in dead:
+                self._voices.pop(p, None)
+
+        # Soft clip / gain
+        out = np.tanh(out * self.gain).astype(np.float32)
+        return out
+
+
+# If the optional wavetable engine is unavailable, transparently use ours.
+if PolyphonicSynth is None:
+    PolyphonicSynth = _BuiltInPolyphonicSynth
+
+
+def _play_beep(freq: int, duration_ms: int, sample_rate: int = 44100) -> None:
+    """Cross-platform replacement for winsound.Beep using sounddevice."""
+    if sd is None:
+        return
+    try:
+        n = max(1, int(sample_rate * duration_ms / 1000.0))
+        t = np.arange(n) / sample_rate
+        tone = 0.25 * np.sin(2.0 * np.pi * freq * t).astype(np.float32)
+        # tiny fade in/out to avoid clicks
+        fade = min(256, n // 20)
+        if fade > 0:
+            tone[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            tone[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        sd.play(tone, samplerate=sample_rate, blocking=False)
+    except Exception:
+        pass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -248,9 +391,9 @@ class PianoRoll(QWidget):
         
         # Layering system
         self.layers: dict = {
-            "drums": {"notes": [], "visible": True, "color": "#4488ff", "sample_name": "Drums", "sample_path": None},
-            "bass": {"notes": [], "visible": True, "color": "#44ff88", "sample_name": "Bass", "sample_path": None},
-            "melody": {"notes": [], "visible": True, "color": "#ff8844", "sample_name": "Melody", "sample_path": None}
+            "drums": {"notes": [], "visible": True, "color": "#9a9a9a", "sample_name": "Drums", "sample_path": None},
+            "bass": {"notes": [], "visible": True, "color": "#bcbcbc", "sample_name": "Bass", "sample_path": None},
+            "melody": {"notes": [], "visible": True, "color": "#7e7e7e", "sample_name": "Melody", "sample_path": None}
         }
         self.current_layer = "drums"  # Active layer for editing
         # Visualization mode
@@ -858,7 +1001,7 @@ class PianoRoll(QWidget):
         # Disable clipping for subsequent drawings
         painter.setClipRect(QRect())  # Clear clipping
     
-    def draw_note(self, painter: QPainter, note: Note, is_ghost: bool = False, is_selected: bool = False, layer_color: str = "#4488ff", layer_opacity: float = 1.0) -> None:
+    def draw_note(self, painter: QPainter, note: Note, is_ghost: bool = False, is_selected: bool = False, layer_color: str = "#9a9a9a", layer_opacity: float = 1.0) -> None:
         """Draw a single note with BeepBox-style clean appearance"""
         painter.save()
         painter.setOpacity(layer_opacity)
@@ -891,7 +1034,7 @@ class PianoRoll(QWidget):
             color = color.lighter(140)
             border_width = 2
         else:
-            color = QColor(layer_color) if not is_ghost else QColor("#55aa55")
+            color = QColor(layer_color) if not is_ghost else QColor("#888888")
             border_width = 1
         
         # Draw the note rectangle
@@ -910,7 +1053,7 @@ class PianoRoll(QWidget):
     def _draw_active_note_highlight(self, painter: QPainter, x: int, y: int, width: int, height: int) -> None:
         painter.setPen(QPen(QColor("#ffffff"), 2, Qt.PenStyle.SolidLine))
         painter.drawRect(x - 1, y - 1, width + 2, height + 2)
-        painter.setPen(QPen(QColor("#ffff88"), 1, Qt.PenStyle.DotLine))
+        painter.setPen(QPen(QColor("#f0f0f0"), 1, Qt.PenStyle.DotLine))
         painter.drawRect(x - 2, y - 2, width + 4, height + 4)
 
     def _draw_velocity_note(self, painter: QPainter, note: Note, x: int, y: int, width: int, height: int, is_ghost: bool, is_selected: bool, layer_color: str) -> None:
@@ -1006,13 +1149,13 @@ class PianoRoll(QWidget):
         height = self.PIXEL_PER_PITCH - 1
         
         # Draw the preview note
-        painter.setPen(QPen(QColor("#4488ff"), 2))
-        painter.fillRect(x1, y, width, height, QBrush(QColor("#4488ff")))
-        painter.setPen(QPen(QColor("#2266dd"), 2))
+        painter.setPen(QPen(QColor("#9a9a9a"), 2))
+        painter.fillRect(x1, y, width, height, QBrush(QColor("#9a9a9a")))
+        painter.setPen(QPen(QColor("#666666"), 2))
         painter.drawRect(x1, y, width, height)
         
         # Draw endpoint markers
-        painter.setPen(QPen(QColor("#88ccff"), 1.5))
+        painter.setPen(QPen(QColor("#cccccc"), 1.5))
         painter.drawLine(x1, y - 4, x1, y - 1)
         painter.drawLine(x1 + width, y - 4, x1 + width, y - 1)
     
@@ -1022,9 +1165,9 @@ class PianoRoll(QWidget):
             return
         
         rect = QRect(self.selection_start, self.selecting_rect).normalized()
-        painter.setPen(QPen(QColor("#88ff88"), 1, Qt.PenStyle.DashLine))
+        painter.setPen(QPen(QColor("#cccccc"), 1, Qt.PenStyle.DashLine))
         painter.drawRect(rect)
-        painter.fillRect(rect, QBrush(QColor(136, 255, 136, 20)))
+        painter.fillRect(rect, QBrush(QColor(200, 200, 200, 28)))
     
     def draw_playback_indicator(self, painter: QPainter) -> None:
         """Draw the playback position line"""
@@ -1035,10 +1178,10 @@ class PianoRoll(QWidget):
         painter.drawLine(x, self.HEADER_HEIGHT, x, self.height())
         
         # Red highlight behind the white line for playback focus
-        painter.setPen(QPen(QColor("#ff4444"), 3))
+        painter.setPen(QPen(QColor("#e8e8e8"), 3))
         painter.drawLine(x, self.HEADER_HEIGHT, x, self.height())
         
-        painter.fillRect(x - 3, 2, 6, self.HEADER_HEIGHT - 4, QBrush(QColor("#ff4444")))
+        painter.fillRect(x - 3, 2, 6, self.HEADER_HEIGHT - 4, QBrush(QColor("#e8e8e8")))
     
     def export_midi(self) -> dict:
         """Export notes as JSON-compatible MIDI data with layers"""
@@ -1352,9 +1495,9 @@ class TerminalGUI(QWidget):
     def add_log_line(self, text: str, line_type: str = 'info') -> None:
         """Add line to terminal output"""
         colors = {
-            'success': '#22dd22',
-            'error': '#dd4444',
-            'warning': '#ddaa22',
+            'success': '#d0d0d0',
+            'error': '#909090',
+            'warning': '#b8b8b8',
             'info': '#e0e0e0'
         }
         color = colors.get(line_type, '#e0e0e0')
@@ -1688,11 +1831,13 @@ class NillApplication(QMainWindow):
         self.on_play_button_clicked()
 
     def play_note_sound(self, note: Note) -> None:
-        if not winsound:
-            return
+        """Play a short tone for a single note (cross-platform)."""
         freq = int(440.0 * (2 ** ((note.pitch - 69) / 12.0)))
         duration_ms = max(30, int((note.duration * 60000.0) / self.piano_roll.bpm))
-        threading.Thread(target=winsound.Beep, args=(freq, duration_ms), daemon=True).start()
+        if winsound is not None:
+            threading.Thread(target=winsound.Beep, args=(freq, duration_ms), daemon=True).start()
+        else:
+            threading.Thread(target=_play_beep, args=(freq, duration_ms), daemon=True).start()
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
