@@ -1,0 +1,264 @@
+import math
+import ctypes
+import sys
+import numpy as np
+try:
+    import pygame
+except ImportError:
+    try:
+        import mygame as pygame
+    except ImportError:
+        print("✗ Missing required module: pygame")
+        print("Install it with 'pip install pygame' and try again.")
+        sys.exit(1)
+import sounddevice as sd
+
+# =========================
+# CONFIG
+# =========================
+NATIVE_W, NATIVE_H = 600, 400  # Smaller fixed size
+SAMPLE_RATE = 44100
+BLOCK_SIZE = 2048
+GHOST_TRAIL_COUNT = 6
+GHOST_FADE = 0.12
+FRAME_RADIUS = 20
+
+# AUDIO DEVICE DETECTION
+print("Scanning for audio devices...")
+devices = sd.query_devices()
+AUDIO_DEVICE = None
+
+# Try to find Stereo Mix automatically
+stereo_mix_keywords = ['stereo mix', 'what u hear', 'loopback', 'wave out', 'out mix', 'realtek stereo', 'virtual audio']
+for i, device in enumerate(devices):
+    if device['max_input_channels'] > 0:
+        name_lower = device['name'].lower()
+        if any(keyword in name_lower for keyword in stereo_mix_keywords):
+            AUDIO_DEVICE = i
+            print(f"✓ Found: [{i}] {device['name']}")
+            break
+
+if AUDIO_DEVICE is None:
+    print("✗ No Stereo Mix detected!")
+    print("Using default input device...")
+    # Will use default if None
+
+pygame.init()
+screen = pygame.display.set_mode((NATIVE_W, NATIVE_H))  # Fixed size, no resize
+pygame.display.set_caption("Ear Candy")
+
+clock = pygame.time.Clock()
+
+# =========================
+# WINDOW MANAGEMENT (Windows)
+# =========================
+# Note: Always-on-top functionality removed due to window freezing issues
+# The visualizer window can be manually positioned as needed
+
+def set_always_on_top(enabled):
+    # Disabled to prevent window freezing
+    pass
+
+# =========================
+# AUDIO SETUP
+# =========================
+print(f"Initializing audio device [{AUDIO_DEVICE}]...")
+
+audio_block = np.zeros((BLOCK_SIZE, 2), dtype=np.float32)
+
+def audio_callback(indata, frames, time, status):
+    global audio_block
+    audio_block = indata.copy()
+
+try:
+    stream = sd.InputStream(
+        device=AUDIO_DEVICE,
+        callback=audio_callback,
+        blocksize=BLOCK_SIZE,
+        channels=2,
+        samplerate=SAMPLE_RATE
+    )
+    stream.start()
+    print("✓ Audio initialized successfully")
+except Exception as e:
+    print(f"✗ Audio error: {e}")
+    print("Make sure device 14 (Stereo Mix) is enabled")
+    import sys
+    sys.exit(1)
+
+# =========================
+# SPLINE SMOOTHING
+# =========================
+def catmull_rom(points, samples=8):
+    if len(points) < 4:
+        return points
+    smoothed = []
+    for i in range(1, len(points) - 2):
+        p0, p1, p2, p3 = points[i - 1], points[i], points[i + 1], points[i + 2]
+        for t in np.linspace(0, 1, samples, endpoint=False):
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * (
+                (2 * p1[0]) +
+                (-p0[0] + p2[0]) * t +
+                (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
+                (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1]) +
+                (-p0[1] + p2[1]) * t +
+                (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
+                (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3
+            )
+            smoothed.append((x, y))
+    smoothed.append(points[-2])
+    smoothed.append(points[-1])
+    return smoothed
+
+# =========================
+# SURFACES
+# =========================
+visual_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+blur_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+ghost_trails = []
+
+# Frame setup
+frame_rect = pygame.Rect(15, 15, NATIVE_W - 30, NATIVE_H - 30)
+
+frame_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+pygame.draw.rect(
+    frame_surface,
+    (255, 255, 255),
+    frame_rect,
+    width=3,
+    border_radius=FRAME_RADIUS
+)
+
+clip_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+pygame.draw.rect(
+    clip_surface,
+    (255, 255, 255),
+    frame_rect,
+    border_radius=FRAME_RADIUS
+)
+
+# =========================
+# UI
+# =========================
+float_enabled = False
+button_rect = pygame.Rect(20, 20, 160, 45)
+font = pygame.font.SysFont("Segoe UI", 20, bold=True)
+
+PANEL_HEIGHT = 80
+
+def draw_glass_panel(surface):
+    glass = pygame.Surface((NATIVE_W, PANEL_HEIGHT), pygame.SRCALPHA)
+    glass.fill((30, 30, 30, 160))
+    surface.blit(glass, (0, 0))
+
+    reflection = pygame.Surface((NATIVE_W, PANEL_HEIGHT // 2), pygame.SRCALPHA)
+    for y in range(reflection.get_height()):
+        alpha = int(80 * (1 - y / reflection.get_height()))
+        pygame.draw.line(reflection, (255, 255, 255, alpha), (0, y), (NATIVE_W, y))
+    surface.blit(reflection, (0, 0))
+
+# =========================
+# MAIN LOOP
+# =========================
+running = True
+
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if button_rect.collidepoint(event.pos):
+                # Button is now just informational
+                pass
+
+    # Motion blur
+    blur_surface.fill((0, 0, 0, 40))
+    visual_surface.blit(blur_surface, (0, 0))
+
+    # AUDIO → WAVEFORM
+    mono = np.mean(audio_block, axis=1)
+    audio_level = np.mean(np.abs(mono))
+    
+    # Boost audio level for better sensitivity
+    audio_level_boosted = audio_level * 10  # 10x amplification
+    
+    if audio_level_boosted > 0.001:  # Much lower threshold
+        max_val = np.max(np.abs(mono))
+        if max_val > 0:
+            mono = mono / max_val
+    else:  # Silent - subtle wave animation
+        t = pygame.time.get_ticks() / 1000.0
+        mono = np.sin(np.linspace(0, 2*np.pi, len(mono)) + t * 0.5) * 0.3
+    
+    mono = np.interp(
+        np.linspace(0, len(mono), frame_rect.width),
+        np.arange(len(mono)),
+        mono
+    )
+
+    points = []
+    mid_y = frame_rect.y + frame_rect.height / 2
+    amp = frame_rect.height * 0.45
+
+    for i, sample in enumerate(mono):
+        x = frame_rect.x + i
+        y = int(mid_y + sample * amp)
+        points.append((x, y))
+
+    if len(points) > 4:
+        points = catmull_rom(points, samples=4)
+
+    ghost_trails.insert(0, points)
+    if len(ghost_trails) > GHOST_TRAIL_COUNT:
+        ghost_trails.pop()
+    
+    if audio_level_boosted <= 0.001:
+        ghost_trails.clear()
+
+    wave_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+
+    # Ghost trails (thin white lines, fading)
+    for idx, trail in enumerate(ghost_trails):
+        alpha = int(255 * max(0, 1 - idx * GHOST_FADE))
+        color = (255, 255, 255, alpha)
+        if len(trail) > 1:
+            pygame.draw.lines(wave_surface, color, False, trail, 2)
+
+    # Main waveform (5px white line)
+    if len(points) > 1:
+        pygame.draw.lines(wave_surface, (255, 255, 255, 255), False, points, 5)
+
+    # Clip waveform to rounded frame
+    mask = pygame.mask.from_surface(clip_surface)
+    mask_surf = mask.to_surface(setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
+    wave_surface.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+    # Dark background inside frame
+    inner_bg = pygame.Surface((frame_rect.width, frame_rect.height), pygame.SRCALPHA)
+    inner_bg.fill((10, 10, 10))
+    visual_surface.blit(inner_bg, frame_rect.topleft)
+
+    # Blit waveform
+    visual_surface.blit(wave_surface, (0, 0))
+
+    # Draw frame
+    visual_surface.blit(frame_surface, (0, 0))
+
+    # Glass panel + button
+    draw_glass_panel(visual_surface)
+
+    # Display
+    screen.fill((0, 0, 0))
+    screen.blit(visual_surface, (0, 0))
+
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
+stream.stop()
+stream.close()
