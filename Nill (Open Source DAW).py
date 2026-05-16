@@ -284,6 +284,11 @@ class PlaylistView(QWidget):
         self._clip_cache: List[Tuple[int, int, PlaylistClip]] = []
         self._cache_valid = False
 
+        # --- FIX: prevent white square covering the playlist ---
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+
     @property
     def BEAT_W(self) -> float:
         return self.BEAT_W_BASE * self.zoom_x
@@ -417,6 +422,7 @@ class PlaylistView(QWidget):
         tri = QPolygon([QPoint(int(px), self.HEADER_H), QPoint(int(px - 5), self.HEADER_H - 7), QPoint(int(px + 5), self.HEADER_H - 7)])
         painter.drawPolygon(tri)
 
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor("#333"), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
@@ -567,6 +573,10 @@ class PianoRoll(QWidget):
         self.setMinimumSize(600, 300)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # --- FIX: prevent stylesheet background from painting over custom paint ---
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
         self.selected_note: Optional[Note] = None
         self.drag_mode: Optional[str] = None
         self.drag_note_start_beat = 0.0
@@ -813,7 +823,7 @@ class PianoRoll(QWidget):
 class Nill(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NILL | FL-Style Playlist DAW")
+        self.setWindowTitle("NILL | Terminal Interface DAW")
         self.resize(1600, 950)
         self.setMinimumSize(1200, 700)
 
@@ -1004,6 +1014,11 @@ class Nill(QMainWindow):
         self.playlist_view = PlaylistView(self)
         self.playlist_view.pattern_double_clicked.connect(self.on_pattern_double_clicked)
         self.playlist_scroll.setWidget(self.playlist_view)
+        # --- FIX: make the viewport transparent so it doesn't paint
+        # a white/opaque rectangle on top of our custom-painted widget ---
+        self.playlist_scroll.viewport().setAutoFillBackground(False)
+        self.playlist_scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.playlist_scroll.viewport().setStyleSheet("background: transparent;")
         pc_layout.addWidget(self.playlist_scroll)
         main_splitter.addWidget(playlist_container)
 
@@ -1018,13 +1033,16 @@ class Nill(QMainWindow):
         self.piano_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.piano_roll = PianoRoll(self)
         self.piano_scroll.setWidget(self.piano_roll)
+        # --- FIX: same viewport transparency fix ---
+        self.piano_scroll.viewport().setAutoFillBackground(False)
+        self.piano_scroll.viewport().setStyleSheet("background: transparent;")
         pr_layout.addWidget(self.piano_scroll)
         main_splitter.addWidget(piano_container)
 
         main_splitter.setSizes([520, 340])
         outer.addWidget(main_splitter, 1)
 
-        footer = QLabel("FL-Style Playlist DAW | Select a pattern, right-click on playlist to paint. Double-click clip to edit. | cmds: set bpm ___, show osc, show visualizer")
+        footer = QLabel("Terminal Interface DAW | Select a pattern, right-click on playlist to paint. Double-click clip to edit. | cmds: set bpm ___, show osc, show visualizer")
         footer.setStyleSheet("color:#9A9A9A; padding:3px;")
         outer.addWidget(footer)
 
@@ -1037,6 +1055,7 @@ class Nill(QMainWindow):
             QPushButton#transportCircle { border-radius: 20px; font-size: 22px; font-weight: bold; padding: 0; }
             QPushButton#transportCircle:checked { background: #E6E6E6; color: #080808; border: 2px solid #FFF; }
             QScrollArea { border: 1px solid #4A4A4A; background: #050505; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
             QScrollBar:horizontal, QScrollBar:vertical { background: #0A0A0A; border: 1px solid #2A2A2A; }
             QScrollBar::handle:horizontal, QScrollBar::handle:vertical { background: #777; border: 1px solid #BDBDBD; }
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #141414; border: 1px solid #3F3F3F; padding: 4px; border-radius: 3px; }
@@ -1229,7 +1248,7 @@ class Nill(QMainWindow):
 
     def project_data(self) -> dict:
         return {
-            "app": "Nill FL Playlist", "version": 5,
+            "app": "Nill TERMINAL", "version": 5,
             "bpm": self.bpm, "snap": self.current_snap,
             "patterns": [p.to_dict() for p in self.patterns],
             "tracks": [t.to_dict() for t in self.playlist_tracks],
@@ -2328,7 +2347,7 @@ def main() -> None:
         run_embedded_osc()
         return
 
-    print("Nill | FL-Style Playlist DAW")
+    print("Nill | Terminal Interface DAW")
     print("Features: pattern-based playlist, drag clips, resize, piano roll, smooth playback.")
     print("Commands: set bpm ___, show osc, show visualizer")
     app = QApplication(sys.argv)
