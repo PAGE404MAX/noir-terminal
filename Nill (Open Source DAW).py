@@ -30,6 +30,15 @@ from typing import Dict, List, Optional, Tuple, Hashable
 
 import numpy as np
 
+import zipfile
+import tempfile
+import shutil
+
+try:
+    import mido
+except ImportError:
+    mido = None
+
 try:
     import sounddevice as sd
 except (ImportError, OSError):
@@ -38,7 +47,7 @@ except (ImportError, OSError):
 from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent, QSize, QPoint
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QAction, QPolygon
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QMenu, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
@@ -51,6 +60,74 @@ PATTERN_COLORS = [
     "#8A8A8A", "#737373", "#5C5C5C", "#444444",
     "#AAAAAA", "#666666", "#999999", "#CCCCCC",
 ]
+
+THEMES = {
+    "Terminal": {
+        "bg_main": "#0B0B0B", "bg_header": "#151515", "bg_panel": "#0A0A0A",
+        "bg_row_even": "#111111", "bg_row_odd": "#151515", "bg_muted": "#080808",
+        "bg_piano": "#050505", "key_black": "#202020", "key_white": "#E6E6E6",
+        "row_black": "#141414", "row_white": "#181818",
+        "grid_bar": "#555555", "grid_beat": "#3A3A3A", "grid_fine": "#262626", "grid_sub": "#333333",
+        "text_main": "#E6E6E6", "text_dim": "#777777", "text_bright": "#AAAAAA", "text_label": "#C8C8C8",
+        "text_clip": "#0A0A0A", "accent": "#E6E6E6", "accent_hover": "#FFFFFF",
+        "button_bg": "#1A1A1A", "button_border": "#444444", "button_hover": "#242424",
+        "border": "#4A4A4A", "clip_border": "#DDDDDD", "note_muted": "#5F5F5F",
+        "loop_start": "#4AF", "loop_end": "#F84", "mute": "#F44", "solo": "#FC0", "playhead": "#FFFFFF",
+        "overlay": "#000000",
+    },
+    "Midnight Blue": {
+        "bg_main": "#0A0B10", "bg_header": "#121628", "bg_panel": "#080A14",
+        "bg_row_even": "#0D1020", "bg_row_odd": "#121628", "bg_muted": "#050610",
+        "bg_piano": "#040510", "key_black": "#1A1E30", "key_white": "#C8D0E0",
+        "row_black": "#101228", "row_white": "#141A30",
+        "grid_bar": "#4A5580", "grid_beat": "#2A3050", "grid_fine": "#1A1E38", "grid_sub": "#222540",
+        "text_main": "#D0D8E8", "text_dim": "#606B88", "text_bright": "#8899BB", "text_label": "#A0AACC",
+        "text_clip": "#080A14", "accent": "#6699FF", "accent_hover": "#88BBFF",
+        "button_bg": "#11152A", "button_border": "#334466", "button_hover": "#1A2040",
+        "border": "#334466", "clip_border": "#AABBDD", "note_muted": "#4A5570",
+        "loop_start": "#4488FF", "loop_end": "#FF8844", "mute": "#FF4466", "solo": "#FFCC00", "playhead": "#FFFFFF",
+        "overlay": "#000010",
+    },
+    "Forest": {
+        "bg_main": "#0B100B", "bg_header": "#152015", "bg_panel": "#0A0F0A",
+        "bg_row_even": "#111811", "bg_row_odd": "#152015", "bg_muted": "#080A08",
+        "bg_piano": "#050805", "key_black": "#1E281E", "key_white": "#C8D8C8",
+        "row_black": "#141E14", "row_white": "#182418",
+        "grid_bar": "#558055", "grid_beat": "#3A503A", "grid_fine": "#263826", "grid_sub": "#2A3A2A",
+        "text_main": "#D0E8D0", "text_dim": "#608860", "text_bright": "#88BB88", "text_label": "#AACCAA",
+        "text_clip": "#0A0F0A", "accent": "#88DD88", "accent_hover": "#AAFFAA",
+        "button_bg": "#111A11", "button_border": "#446644", "button_hover": "#1A2A1A",
+        "border": "#446644", "clip_border": "#BBDDBB", "note_muted": "#4A704A",
+        "loop_start": "#44FF88", "loop_end": "#FFAA44", "mute": "#FF6644", "solo": "#FFCC00", "playhead": "#FFFFFF",
+        "overlay": "#001000",
+    },
+    "Crimson": {
+        "bg_main": "#100A0A", "bg_header": "#281212", "bg_panel": "#140808",
+        "bg_row_even": "#201010", "bg_row_odd": "#281212", "bg_muted": "#100505",
+        "bg_piano": "#100404", "key_black": "#301A1A", "key_white": "#E0C8C8",
+        "row_black": "#281010", "row_white": "#301414",
+        "grid_bar": "#805050", "grid_beat": "#503030", "grid_fine": "#381A1A", "grid_sub": "#402222",
+        "text_main": "#E8D0D0", "text_dim": "#886060", "text_bright": "#BB8888", "text_label": "#CCAAAA",
+        "text_clip": "#140808", "accent": "#FF6688", "accent_hover": "#FF88AA",
+        "button_bg": "#2A1111", "button_border": "#664444", "button_hover": "#401818",
+        "border": "#664444", "clip_border": "#DDBBBB", "note_muted": "#705050",
+        "loop_start": "#FF4466", "loop_end": "#FFAA44", "mute": "#FF4444", "solo": "#FFCC00", "playhead": "#FFFFFF",
+        "overlay": "#100000",
+    },
+    "Amber": {
+        "bg_main": "#100C0A", "bg_header": "#281E12", "bg_panel": "#141008",
+        "bg_row_even": "#201811", "bg_row_odd": "#281E12", "bg_muted": "#100A05",
+        "bg_piano": "#100805", "key_black": "#30281A", "key_white": "#E0D8C8",
+        "row_black": "#281E14", "row_white": "#302418",
+        "grid_bar": "#806644", "grid_beat": "#504430", "grid_fine": "#382E1A", "grid_sub": "#403822",
+        "text_main": "#E8DCC8", "text_dim": "#887760", "text_bright": "#BBAA88", "text_label": "#CCBBAA",
+        "text_clip": "#141008", "accent": "#FFAA44", "accent_hover": "#FFCC66",
+        "button_bg": "#2A1E11", "button_border": "#665544", "button_hover": "#402A15",
+        "border": "#665544", "clip_border": "#DDD0BB", "note_muted": "#705A4A",
+        "loop_start": "#FFAA44", "loop_end": "#FF6644", "mute": "#FF6644", "solo": "#FFCC00", "playhead": "#FFFFFF",
+        "overlay": "#100A00",
+    },
+}
 
 # ============================ DATA MODELS ============================
 
@@ -391,11 +468,15 @@ class PlaylistView(QWidget):
         p_max   = max(pitches)
         p_range = max(p_max - p_min, 1)
 
-        painter.fillRect(inner, QColor(0, 0, 0, 60))
+        c_inner = self.daw.theme_color("overlay")
+        c_inner.setAlpha(60)
+        painter.fillRect(inner, c_inner)
 
         num_loops       = int(clip_dur / pat_len)
-        note_color      = QColor(0, 0, 0, 180)
-        loop_line_color = QColor(0, 0, 0, 90)
+        note_color      = self.daw.theme_color("overlay")
+        note_color.setAlpha(180)
+        loop_line_color = self.daw.theme_color("overlay")
+        loop_line_color.setAlpha(90)
 
         # Loop boundary dashes
         for loop_i in range(num_loops + 1):
@@ -431,20 +512,21 @@ class PlaylistView(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+        painter.fillRect(self.rect(), self.daw.theme_color("bg_main"))
 
         total_beats = self.total_beats()
         num_tracks  = len(self.daw.playlist_tracks)
 
         # ---- Ruler background ----
-        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
-        painter.fillRect(0, 0, self.TRACK_HEADER_W, self.height(), QColor("#0A0A0A"))
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, self.daw.theme_color("bg_header"))
+        painter.fillRect(0, 0, self.TRACK_HEADER_W, self.height(), self.daw.theme_color("bg_panel"))
 
         # ---- Loop region shading on ruler ----
         if self.daw.loop_enabled:
             lx1 = self.beat_to_x(self.daw.loop_start)
             lx2 = self.beat_to_x(self.daw.loop_end)
-            loop_fill = QColor(80, 160, 255, 38)
+            loop_fill = self.daw.theme_color("loop_start")
+            loop_fill.setAlpha(38)
             painter.fillRect(QRectF(lx1, 0, lx2 - lx1, self.HEADER_H), loop_fill)
 
         # ---- Bar grid + numbers ----
@@ -452,22 +534,22 @@ class PlaylistView(QWidget):
         for beat in range(int(total_beats) + 1):
             x      = self.beat_to_x(beat)
             is_bar = beat % 4 == 0
-            color  = QColor("#666") if is_bar else QColor("#333")
+            color  = self.daw.theme_color("grid_bar") if is_bar else self.daw.theme_color("grid_sub")
             painter.setPen(QPen(color, 1))
             painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
             if is_bar and beat < total_beats:
-                painter.setPen(QColor("#AAA"))
+                painter.setPen(self.daw.theme_color("text_bright"))
                 painter.drawText(int(x + 4), 18, str(beat // 4 + 1))
 
         # ---- Loop handles on ruler ----
         # Draw a thin line + triangle handle for start and end
-        for handle_beat, color_hex, side in [
-            (self.daw.loop_start, "#4AF", "start"),
-            (self.daw.loop_end,   "#F84", "end"),
+        for handle_beat, side in [
+            (self.daw.loop_start, "start"),
+            (self.daw.loop_end,   "end"),
         ]:
             hx    = int(self.beat_to_x(handle_beat))
-            hcol  = QColor(color_hex)
-            hcol2 = QColor(color_hex)
+            hcol  = self.daw.theme_color("loop_start" if side == "start" else "loop_end")
+            hcol2 = QColor(hcol)
             hcol2.setAlpha(180)
             painter.setPen(QPen(hcol, 2))
             painter.drawLine(hx, 0, hx, self.HEADER_H)
@@ -485,26 +567,26 @@ class PlaylistView(QWidget):
         for t_idx in range(num_tracks):
             y     = self.HEADER_H + t_idx * self.TRACK_HEIGHT
             track = self.daw.playlist_tracks[t_idx]
-            bg    = QColor("#111") if t_idx % 2 == 0 else QColor("#151515")
+            bg    = self.daw.theme_color("bg_row_even") if t_idx % 2 == 0 else self.daw.theme_color("bg_row_odd")
             if track.muted:
-                bg = QColor("#080808")
+                bg = self.daw.theme_color("bg_muted")
             painter.fillRect(self.TRACK_HEADER_W, y,
                              int(self.beat_to_x(total_beats) - self.TRACK_HEADER_W),
                              self.TRACK_HEIGHT, bg)
 
-            header_bg = QColor(track.color) if not track.muted else QColor("#222")
+            header_bg = QColor(track.color) if not track.muted else self.daw.theme_color("note_muted")
             painter.fillRect(0, y, self.TRACK_HEADER_W, self.TRACK_HEIGHT, header_bg.darker(170))
-            painter.setPen(QPen(QColor(track.color if not track.muted else "#444"), 1))
+            painter.setPen(QPen(QColor(track.color if not track.muted else self.daw.theme_color("text_dim").name()), 1))
             painter.drawRect(0, y, self.TRACK_HEADER_W - 1, self.TRACK_HEIGHT - 1)
-            painter.setPen(QColor("#FFF" if not track.muted else "#555"))
+            painter.setPen(self.daw.theme_color("text_main" if not track.muted else "text_dim"))
             painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
             painter.drawText(6, y + 16, track.name[:12])
             painter.setFont(QFont("Consolas", 7))
             if track.muted:
-                painter.setPen(QColor("#F44"))
+                painter.setPen(self.daw.theme_color("mute"))
                 painter.drawText(6, y + 30, "MUTED")
             elif track.solo:
-                painter.setPen(QColor("#FC0"))
+                painter.setPen(self.daw.theme_color("solo"))
                 painter.drawText(6, y + 30, "SOLO")
 
         # ---- Clips ----
@@ -518,11 +600,11 @@ class PlaylistView(QWidget):
                 pattern = self.daw.patterns[clip.pattern_index]
                 fill    = QColor(pattern.color)
                 if track.muted:
-                    fill = QColor("#222")
-                border = QColor("#DDD")
+                    fill = self.daw.theme_color("note_muted")
+                border = self.daw.theme_color("clip_border")
                 if self.selected_clip == (t_idx, c_idx):
                     fill   = fill.lighter(125)
-                    border = QColor("#FFF")
+                    border = self.daw.theme_color("text_main")
                 painter.fillRect(rect, fill)
 
                 # Note minimap
@@ -538,19 +620,21 @@ class PlaylistView(QWidget):
                         if sep_beat >= clip.start_beat + clip_dur:
                             break
                         sx = self.beat_to_x(sep_beat)
-                        painter.setPen(QPen(QColor(0, 0, 0, 100), 1))
+                        c_sep = self.daw.theme_color("overlay")
+                        c_sep.setAlpha(100)
+                        painter.setPen(QPen(c_sep, 1))
                         painter.drawLine(int(sx), int(rect.top() + 2),
                                          int(sx), int(rect.bottom() - 2))
 
                 painter.setPen(QPen(border, 1))
                 painter.drawRect(rect.adjusted(0, 0, -1, -1))
-                painter.setPen(QColor("#0A0A0A"))
+                painter.setPen(self.daw.theme_color("text_clip"))
                 painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
                 txt = pattern.name[:max(3, int(rect.width() / 6))]
                 painter.drawText(rect.adjusted(4, 3, -4, 0),
                                  Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, txt)
                 if rect.width() > 16:
-                    painter.setPen(QPen(QColor("#000"), 1, Qt.PenStyle.DotLine))
+                    painter.setPen(QPen(self.daw.theme_color("overlay"), 1, Qt.PenStyle.DotLine))
                     painter.drawLine(int(rect.left() + 3), int(rect.top() + 5),
                                      int(rect.left() + 3), int(rect.bottom() - 5))
                     painter.drawLine(int(rect.right() - 4), int(rect.top() + 5),
@@ -558,16 +642,16 @@ class PlaylistView(QWidget):
 
         # ---- Playhead ----
         px = self.beat_to_x(self.daw.playhead_song_beat)
-        painter.setPen(QPen(QColor("#FFF"), 2))
+        painter.setPen(QPen(self.daw.theme_color("playhead"), 2))
         painter.drawLine(int(px), self.HEADER_H, int(px), self.height())
-        painter.setBrush(QBrush(QColor("#FFF")))
+        painter.setBrush(QBrush(self.daw.theme_color("playhead")))
         tri = QPolygon([QPoint(int(px), self.HEADER_H),
                         QPoint(int(px - 5), self.HEADER_H - 7),
                         QPoint(int(px + 5), self.HEADER_H - 7)])
         painter.drawPolygon(tri)
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#333"), 1))
+        painter.setPen(QPen(self.daw.theme_color("grid_sub"), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
     # ------------------------------------------------------------------
@@ -937,29 +1021,29 @@ class PianoRoll(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+        painter.fillRect(self.rect(), self.daw.theme_color("bg_main"))
 
         pat        = self.daw.current_pattern()
         grid_right = self.beat_to_x(pat.length_beats)
 
-        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
-        painter.fillRect(0, 0, self.KEYBOARD_W, self.height(), QColor("#050505"))
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, self.daw.theme_color("bg_header"))
+        painter.fillRect(0, 0, self.KEYBOARD_W, self.height(), self.daw.theme_color("bg_piano"))
 
         for pitch in range(self.MAX_MIDI, self.MIN_MIDI - 1, -1):
             y        = self.pitch_to_y(pitch)
             row_rect = QRectF(self.KEYBOARD_W, y, max(0, grid_right - self.KEYBOARD_W), self.ROW_H)
             key_rect = QRectF(0, y, self.KEYBOARD_W, self.ROW_H)
             if self.is_black(pitch):
-                key_color, row_color = QColor("#202020"), QColor("#141414")
+                key_color, row_color = self.daw.theme_color("key_black"), self.daw.theme_color("row_black")
             else:
-                key_color, row_color = QColor("#E6E6E6"), QColor("#181818")
+                key_color, row_color = self.daw.theme_color("key_white"), self.daw.theme_color("row_white")
             painter.fillRect(row_rect, row_color)
             painter.fillRect(key_rect, key_color)
-            painter.setPen(QPen(QColor("#2A2A2A"), 1))
+            painter.setPen(QPen(self.daw.theme_color("border"), 1))
             painter.drawLine(int(self.KEYBOARD_W), int(y), int(grid_right), int(y))
-            painter.setPen(QPen(QColor("#0F0F0F"), 1))
+            painter.setPen(QPen(self.daw.theme_color("bg_main"), 1))
             painter.drawRect(key_rect)
-            label_color = QColor("#111") if not self.is_black(pitch) else QColor("#E4E4E4")
+            label_color = self.daw.theme_color("text_clip") if not self.is_black(pitch) else self.daw.theme_color("text_main")
             painter.setPen(label_color)
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(key_rect.adjusted(6, 0, -4, 0),
@@ -972,13 +1056,13 @@ class PianoRoll(QWidget):
         for i in range(steps + 1):
             beat  = i * snap
             x     = self.beat_to_x(beat)
-            color = (QColor("#555") if abs(beat % 4.0) < 0.001
-                     else QColor("#3A3A3A") if i % int(max(1, round(1.0 / snap))) == 0
-                     else QColor("#262626"))
+            color = (self.daw.theme_color("grid_bar") if abs(beat % 4.0) < 0.001
+                     else self.daw.theme_color("grid_beat") if i % int(max(1, round(1.0 / snap))) == 0
+                     else self.daw.theme_color("grid_fine"))
             painter.setPen(QPen(color, 1))
             painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
 
-        painter.setPen(QPen(QColor("#C8C8C8"), 1))
+        painter.setPen(QPen(self.daw.theme_color("text_label"), 1))
         painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         for beat in range(int(pat.length_beats) + 1):
             x = self.beat_to_x(beat)
@@ -986,22 +1070,22 @@ class PianoRoll(QWidget):
             if beat < pat.length_beats:
                 painter.drawText(int(x + 4), 20, str(beat + 1))
 
-        painter.setPen(QColor("#777"))
+        painter.setPen(self.daw.theme_color("text_dim"))
         painter.drawText(10, 20, "PIANO")
         painter.drawText(self.KEYBOARD_W + 8, 20, f"Pattern: {pat.name} [{pat.waveform}]")
 
         for note in pat.notes:
             rect   = self.note_rect(note)
             fill   = QColor(pat.color)
-            if note.muted: fill = QColor("#5F5F5F")
-            border = QColor("#F4F4F4")
+            if note.muted: fill = self.daw.theme_color("note_muted")
+            border = self.daw.theme_color("clip_border")
             if self.selected_note is note:
                 fill   = fill.lighter(135)
-                border = QColor("#FFF")
+                border = self.daw.theme_color("text_main")
             painter.fillRect(rect, fill)
             painter.setPen(QPen(border, 1))
             painter.drawRect(rect)
-            painter.setPen(QPen(QColor("#0A0A0A"), 1))
+            painter.setPen(QPen(self.daw.theme_color("text_clip"), 1))
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(rect.adjusted(4, 0, -4, 0),
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -1010,10 +1094,10 @@ class PianoRoll(QWidget):
         if self.daw.playing:
             local = self.daw.playhead_song_beat % pat.length_beats
             px    = self.beat_to_x(local)
-            painter.setPen(QPen(QColor("#FFF"), 2))
+            painter.setPen(QPen(self.daw.theme_color("playhead"), 2))
             painter.drawLine(int(px), self.HEADER_H, int(px), self.height())
 
-        painter.setPen(QPen(QColor("#4A4A4A"), 1))
+        painter.setPen(QPen(self.daw.theme_color("border"), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
     def mousePressEvent(self, event) -> None:
@@ -1129,6 +1213,9 @@ class Nill(QMainWindow):
         self._preview_keys:     set = set()
         self.osc_process        = None
         self.visualizer_process = None
+
+        self.current_theme_name = "Terminal"
+        self.theme = THEMES["Terminal"]
 
         self.synth  = ChiptuneSynth()
         self.stream = None
@@ -1301,7 +1388,7 @@ class Nill(QMainWindow):
         # Command line
         top_layout.addWidget(QLabel(">"))
         self.command_line = QLineEdit()
-        self.command_line.setPlaceholderText("set bpm ___ | show osc | show visualizer")
+        self.command_line.setPlaceholderText("set bpm ___ | settings | show osc | show visualizer")
         self.command_line.setMinimumWidth(260)
         self.command_line.returnPressed.connect(self.run_command_line)
         top_layout.addWidget(self.command_line, 1)
@@ -1360,33 +1447,12 @@ class Nill(QMainWindow):
 
         footer = QLabel(
             "NILL DAW  |  ⟲ = song loop  |  blue handle = loop start  |  orange handle = loop end  "
-            "|  cmds: set bpm ___  show osc  show visualizer"
+            "|  cmds: set bpm ___ | settings | show osc | show visualizer"
         )
         footer.setStyleSheet("color:#9A9A9A; padding:3px;")
         outer.addWidget(footer)
 
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background: #0A0A0A; color: #E6E6E6;
-                font-family: Consolas, 'Courier New', monospace; font-size: 11px;
-            }
-            QPushButton { background: #1A1A1A; border: 1px solid #444; padding: 5px; border-radius: 4px; }
-            QPushButton:hover { background: #242424; }
-            QPushButton:checked { background: #D9D9D9; color: #080808; border: 1px solid #FFF; }
-            QPushButton#transportCircle {
-                border-radius: 20px; font-size: 22px; font-weight: bold; padding: 0;
-            }
-            QPushButton#transportCircle:checked { background: #E6E6E6; color: #080808; border: 2px solid #FFF; }
-            QScrollArea { border: 1px solid #4A4A4A; background: #050505; }
-            QScrollArea > QWidget > QWidget { background: transparent; }
-            QScrollBar:horizontal, QScrollBar:vertical { background: #0A0A0A; border: 1px solid #2A2A2A; }
-            QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
-                background: #777; border: 1px solid #BDBDBD;
-            }
-            QLineEdit, QComboBox, QSpinBox { background: #141414; border: 1px solid #3F3F3F; padding: 4px; border-radius: 3px; }
-            QLabel { color: #E6E6E6; }
-            QSplitter::handle { background: #333; }
-        """)
+        self.update_stylesheet()
 
         for btn in self.findChildren(QPushButton):
             if btn.objectName() != "transportCircle":
@@ -1438,6 +1504,52 @@ class Nill(QMainWindow):
         self.piano_roll.setMinimumHeight(max(300, h))
         self.piano_roll.updateGeometry()
         self.piano_roll.update()
+
+
+    # ------------------------------------------------------------------
+    # Theme helpers
+    # ------------------------------------------------------------------
+
+    def theme_color(self, key: str, alpha: Optional[int] = None) -> QColor:
+        c = QColor(self.theme.get(key, "#E6E6E6"))
+        if alpha is not None:
+            c.setAlpha(alpha)
+        return c
+
+    def apply_theme(self, name: str) -> None:
+        self.current_theme_name = name
+        self.theme = THEMES[name]
+        self.update_stylesheet()
+        self.playlist_view.update()
+        self.piano_roll.update()
+        for dlg in self.findChildren(QDialog):
+            if hasattr(dlg, "on_theme_changed"):
+                dlg.on_theme_changed()
+
+    def update_stylesheet(self) -> None:
+        t = self.theme
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background: {t['bg_panel']}; color: {t['text_main']};
+                font-family: Consolas, 'Courier New', monospace; font-size: 11px;
+            }}
+            QPushButton {{ background: {t['button_bg']}; border: 1px solid {t['button_border']}; padding: 5px; border-radius: 4px; color: {t['text_main']}; }}
+            QPushButton:hover {{ background: {t['button_hover']}; }}
+            QPushButton:checked {{ background: {t['accent']}; color: {t['bg_panel']}; border: 1px solid {t['accent_hover']}; }}
+            QPushButton#transportCircle {{
+                border-radius: 20px; font-size: 22px; font-weight: bold; padding: 0;
+            }}
+            QPushButton#transportCircle:checked {{ background: {t['accent']}; color: {t['bg_panel']}; border: 2px solid {t['accent_hover']}; }}
+            QScrollArea {{ border: 1px solid {t['border']}; background: {t['bg_piano']}; }}
+            QScrollArea > QWidget > QWidget {{ background: transparent; }}
+            QScrollBar:horizontal, QScrollBar:vertical {{ background: {t['bg_panel']}; border: 1px solid {t['grid_sub']}; }}
+            QScrollBar::handle:horizontal, QScrollBar::handle:vertical {{
+                background: {t['text_dim']}; border: 1px solid {t['text_bright']};
+            }}
+            QLineEdit, QComboBox, QSpinBox {{ background: {t['bg_header']}; border: 1px solid {t['button_border']}; padding: 4px; border-radius: 3px; color: {t['text_main']}; }}
+            QLabel {{ color: {t['text_main']}; }}
+            QSplitter::handle {{ background: {t['grid_sub']}; }}
+        """)
 
     # ------------------------------------------------------------------
     # Transport
@@ -1663,6 +1775,121 @@ class Nill(QMainWindow):
             btn.setChecked(i == self.selected_pattern_index)
             btn.blockSignals(False)
 
+
+    # ------------------------------------------------------------------
+    # Import / Settings
+    # ------------------------------------------------------------------
+
+    def show_settings_dialog(self) -> None:
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
+    def import_drums(self, zip_path: str) -> None:
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                audio_files = [n for n in zf.namelist() if n.lower().endswith(('.wav', '.mp3', '.ogg', '.flac'))]
+                if not audio_files:
+                    QMessageBox.warning(self, "Import Drums", "No audio files found in the ZIP.")
+                    return
+            kit_name = Path(zip_path).stem
+            pat = Pattern(
+                name=f"Kit: {kit_name}",
+                color=PATTERN_COLORS[len(self.patterns) % len(PATTERN_COLORS)],
+                waveform="noise",
+                length_beats=4.0,
+            )
+            for beat in range(4):
+                pat.notes.append(Note(pitch=36, start=float(beat), duration=0.5, velocity=100))
+            self.patterns.append(pat)
+            idx = len(self.playlist_tracks)
+            track_color = PATTERN_COLORS[idx % len(PATTERN_COLORS)]
+            self.playlist_tracks.append(PlaylistTrack(name=f"Drum {idx+1}", color=track_color))
+            self.playlist_tracks[-1].clips.append(PlaylistClip(
+                pattern_index=len(self.patterns)-1,
+                track_index=idx,
+                start_beat=0.0,
+                duration_beats=pat.length_beats,
+            ))
+            self.refresh_pattern_buttons()
+            self.playlist_view.updateGeometry()
+            self.playlist_view.update()
+            self.piano_roll.update()
+            QMessageBox.information(self, "Import Drums", f"Imported '{kit_name}' with {len(audio_files)} sample(s).\nCreated Pattern '{pat.name}' and Track {idx+1}.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Drums Failed", str(exc))
+
+    def import_midi(self, path: str) -> None:
+        if mido is None:
+            QMessageBox.critical(
+                self, "Import MIDI",
+                "The 'mido' package is required to import MIDI files.\n"
+                "Install it with: pip install mido"
+            )
+            return
+        try:
+            mid = mido.MidiFile(path)
+            tempo = 500000
+            ticks_per_beat = mid.ticks_per_beat
+            raw_notes: List[Note] = []
+            active: Dict[int, List[dict]] = {}
+            for track in mid.tracks:
+                abs_ticks = 0
+                for msg in track:
+                    abs_ticks += msg.time
+                    if msg.type == 'set_tempo':
+                        tempo = msg.tempo
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        if msg.note not in active:
+                            active[msg.note] = []
+                        active[msg.note].append({
+                            'pitch': msg.note,
+                            'start_ticks': abs_ticks,
+                            'velocity': msg.velocity,
+                        })
+                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                        if msg.note in active and active[msg.note]:
+                            on = active[msg.note].pop(0)
+                            dur_ticks = abs_ticks - on['start_ticks']
+                            start_sec = mido.tick2second(on['start_ticks'], ticks_per_beat, tempo)
+                            dur_sec = mido.tick2second(dur_ticks, ticks_per_beat, tempo)
+                            start_beats = start_sec * (self.bpm / 60.0)
+                            dur_beats = max(self.current_snap, dur_sec * (self.bpm / 60.0))
+                            raw_notes.append(Note(
+                                pitch=on['pitch'],
+                                start=start_beats,
+                                duration=dur_beats,
+                                velocity=on['velocity'],
+                            ))
+            if not raw_notes:
+                QMessageBox.warning(self, "Import MIDI", "No note events found in the file.")
+                return
+            max_end = max(n.start + n.duration for n in raw_notes)
+            length_beats = max(4.0, math.ceil(max_end / 4.0) * 4.0)
+            pat = Pattern(
+                name=f"MIDI: {Path(path).stem}",
+                color=PATTERN_COLORS[len(self.patterns) % len(PATTERN_COLORS)],
+                waveform="sine",
+                length_beats=length_beats,
+                notes=raw_notes,
+            )
+            self.patterns.append(pat)
+            idx = len(self.playlist_tracks)
+            track_color = PATTERN_COLORS[idx % len(PATTERN_COLORS)]
+            self.playlist_tracks.append(PlaylistTrack(name=f"MIDI {idx+1}", color=track_color))
+            self.playlist_tracks[-1].clips.append(PlaylistClip(
+                pattern_index=len(self.patterns)-1,
+                track_index=idx,
+                start_beat=0.0,
+                duration_beats=pat.length_beats,
+            ))
+            self.refresh_pattern_buttons()
+            self.playlist_view.updateGeometry()
+            self.playlist_view.update()
+            self.piano_roll.update()
+            QMessageBox.information(self, "Import MIDI", f"Imported {len(raw_notes)} note(s) from '{Path(path).name}'.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Import MIDI Failed", str(exc))
+
     # ------------------------------------------------------------------
     # Command line
     # ------------------------------------------------------------------
@@ -1681,12 +1908,14 @@ class Nill(QMainWindow):
                 QMessageBox.warning(self, "Command", "BPM must be 40–260."); return
             self.bpm_spin.setValue(bpm)
             self.command_line.clear(); return
+        if command == "settings":
+            self.command_line.clear(); self.show_settings_dialog(); return
         if command == "show osc":
             self.command_line.clear(); self.show_osc(); return
         if command == "show visualizer":
             self.command_line.clear(); self.show_visualizer(); return
         QMessageBox.warning(self, "Command",
-                            "Allowed commands:\nset bpm ___\nshow osc\nshow visualizer")
+                            "Allowed commands:\nset bpm ___\nsettings\nshow osc\nshow visualizer")
 
     def show_osc(self) -> None:
         if self.osc_process is not None and self.osc_process.poll() is None:
@@ -1744,6 +1973,128 @@ class Nill(QMainWindow):
             try: self.stream.stop(); self.stream.close()
             except Exception: pass
         super().closeEvent(event)
+
+# ============================ SETTINGS DIALOG ============================
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent: "Nill") -> None:
+        super().__init__(parent)
+        self.daw = parent
+        self.setWindowTitle("Settings")
+        self.setMinimumSize(520, 420)
+        self.theme_buttons: Dict[str, QPushButton] = {}
+        self.build_ui()
+        self.apply_theme_style()
+
+    def build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("◈ NILL SETTINGS")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #FFF;")
+        layout.addWidget(title)
+
+        # Import Drums
+        drums_box = QFrame()
+        drums_layout = QVBoxLayout(drums_box)
+        drums_layout.addWidget(QLabel("⬡ Import Drums"))
+        drums_layout.addWidget(QLabel("Browse a ZIP containing WAV / MP3 / OGG / FLAC drum kits."))
+        btn_drums = QPushButton("Import Drums")
+        btn_drums.clicked.connect(self.import_drums)
+        drums_layout.addWidget(btn_drums)
+        layout.addWidget(drums_box)
+
+        # Import MIDI
+        midi_box = QFrame()
+        midi_layout = QVBoxLayout(midi_box)
+        midi_layout.addWidget(QLabel("♩ Import MIDI"))
+        midi_layout.addWidget(QLabel("Browse for a .mid / .midi file and import note events."))
+        btn_midi = QPushButton("Import MIDI")
+        btn_midi.clicked.connect(self.import_midi)
+        midi_layout.addWidget(btn_midi)
+        layout.addWidget(midi_box)
+
+        # Themes
+        themes_box = QFrame()
+        themes_layout = QVBoxLayout(themes_box)
+        themes_layout.addWidget(QLabel("◈ Themes"))
+        grid = QHBoxLayout()
+        for name in THEMES:
+            btn = QPushButton(f"● {name}")
+            btn.setProperty("theme_name", name)
+            btn.clicked.connect(lambda checked=False, n=name: self.daw.apply_theme(n))
+            grid.addWidget(btn)
+            self.theme_buttons[name] = btn
+        themes_layout.addLayout(grid)
+        layout.addWidget(themes_box)
+
+        # Info
+        btn_info = QPushButton("ℹ Info")
+        btn_info.clicked.connect(self.show_info)
+        layout.addWidget(btn_info)
+
+        # Close
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+        self.on_theme_changed()
+
+    def apply_theme_style(self) -> None:
+        t = self.daw.theme
+        self.setStyleSheet(f"""
+            QDialog {{ background: {t['bg_main']}; color: {t['text_main']}; border: 1px solid {t['border']}; }}
+            QFrame {{ background: {t['bg_header']}; border: 1px solid {t['border']}; border-radius: 6px; }}
+            QLabel {{ color: {t['text_main']}; padding: 2px; }}
+            QPushButton {{ background: {t['button_bg']}; border: 1px solid {t['button_border']}; color: {t['text_main']}; padding: 6px 12px; border-radius: 4px; }}
+            QPushButton:hover {{ background: {t['button_hover']}; }}
+        """)
+        for w in self.findChildren(QLabel):
+            if w.text().startswith("◈"):
+                w.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {t['accent_hover']};")
+
+    def on_theme_changed(self) -> None:
+        self.apply_theme_style()
+        for name, btn in self.theme_buttons.items():
+            t = THEMES[name]
+            active = name == self.daw.current_theme_name
+            border = t['accent_hover'] if active else t['button_border']
+            btn.setStyleSheet(f"background: {t['accent']}; color: {t['bg_panel']}; border: 2px solid {border}; padding: 8px; font-weight: {'bold' if active else 'normal'};")
+
+    def import_drums(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Drum Kit (ZIP)", str(Path.home()),
+            "ZIP Archives (*.zip);;All Files (*)"
+        )
+        if path:
+            self.daw.import_drums(path)
+
+    def import_midi(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import MIDI", str(Path.home()),
+            "MIDI Files (*.mid *.midi);;All Files (*)"
+        )
+        if path:
+            self.daw.import_midi(path)
+
+    def show_info(self) -> None:
+        QMessageBox.information(
+            self, "About NILL",
+            "NILL | Open Source Terminal Interface DAW\n\n"
+            "Version 6.0\n"
+            "Built with PySide6, NumPy, and sounddevice.\n\n"
+            "Commands:\n"
+            "  settings          – open this dialog\n"
+            "  set bpm ___       – change tempo\n"
+            "  show osc          – open synthesizer\n"
+            "  show visualizer   – open audio visualizer\n\n"
+            "Shortcuts:\n"
+            "  Space             – play/stop\n"
+            "  Delete            – delete selected note\n"
+            "  Ctrl+S            – save project\n"
+            "  Ctrl+O            – open project"
+        )
 
 # ============================ EMBEDDED OSC ============================
 
