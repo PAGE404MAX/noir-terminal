@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-FIXESNEEDED | monochrome terminal DAW
+NILL | Open Souce DAW!
 
-FIXESNEEDED code with the Nill left-sidebar/UI design recolored to a black-and-white terminal feel.
-
-Inspired by:
-- FL Studio-style piano roll ideas: ghost notes, scale highlighting, stamp/chord tool,
-  channel-style track list, visible piano keyboard, editable note blocks.
-- BeepBox-style ideas: pattern-first composition, fast grid entry, high-contrast monochrome chiptune-friendly
-  tracks, multiple rows/tracks playing simultaneously.
+- Horizontal timeline with pattern blocks/clips on tracks
+- Drag clips to move, resize edges, double-click to edit in piano roll
+- Reusable patterns: edit once, all clips update
+- Track mute/solo
+- Smooth playback with optimized clip lookup
+- Per-pattern piano roll
+- Commands: set bpm ___, show osc, show visualizer
 
 Requirements:
     pip install PySide6 sounddevice numpy
-
-Notes:
-- This is a single-file desktop prototype, not a full DAW.
-- If sounddevice is unavailable, the editor still works visually.
 """
 
 from __future__ import annotations
@@ -37,65 +33,38 @@ try:
 except (ImportError, OSError):
     sd = None
 
-from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QAction
+from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QEvent, QSize, QPoint
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QAction, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
-    QCompleter,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QMenu,
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
-
-# ============================ DATA MODELS ============================
+# ============================ CONSTANTS ============================
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-BLACK_PITCH_CLASSES = {1, 3, 6, 8, 10}
-SCALE_INTERVALS = {
-    "Chromatic": set(range(12)),
-    "Major": {0, 2, 4, 5, 7, 9, 11},
-    "Minor": {0, 2, 3, 5, 7, 8, 10},
-    "Pentatonic": {0, 2, 4, 7, 9},
-    "Harmonic Minor": {0, 2, 3, 5, 7, 8, 11},
-}
-STAMP_INTERVALS = {
-    "Single": [0],
-    "Power": [0, 7],
-    "Major": [0, 4, 7],
-    "Minor": [0, 3, 7],
-    "Sus2": [0, 2, 7],
-    "Sus4": [0, 5, 7],
-    "Maj7": [0, 4, 7, 11],
-    "Min7": [0, 3, 7, 10],
-}
-DEFAULT_TRACK_COLORS = [
-    "#E6E6E6",
-    "#CFCFCF",
-    "#B8B8B8",
-    "#FFFFFF",
-    "#8A8A8A",
-    "#737373",
-    "#5C5C5C",
-    "#444444",
+PATTERN_COLORS = [
+    "#E6E6E6", "#CFCFCF", "#B8B8B8", "#FFFFFF",
+    "#8A8A8A", "#737373", "#5C5C5C", "#444444",
+    "#AAAAAA", "#666666", "#999999", "#CCCCCC",
 ]
 
+# ============================ DATA MODELS ============================
 
 @dataclass
 class Note:
@@ -120,83 +89,103 @@ class Note:
 
 
 @dataclass
-class Track:
+class Pattern:
     name: str
     color: str
+    length_beats: float = 4.0
     waveform: str = "square"
-    gain: float = 0.65
-    patterns: Dict[int, List[Note]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        for i in range(8):
-            self.patterns.setdefault(i, [])
+    gain: float = 0.70
+    notes: List[Note] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            "name": self.name,
-            "color": self.color,
-            "waveform": self.waveform,
-            "gain": self.gain,
-            "patterns": {
-                str(index): [note.to_dict() for note in notes]
-                for index, notes in self.patterns.items()
-            },
+            "name": self.name, "color": self.color,
+            "length_beats": self.length_beats, "waveform": self.waveform,
+            "gain": self.gain, "notes": [n.to_dict() for n in self.notes],
         }
 
     @staticmethod
-    def from_dict(data: dict) -> "Track":
-        patterns = {}
-        raw_patterns = data.get("patterns", {})
-        for key, notes in raw_patterns.items():
-            patterns[int(key)] = [Note.from_dict(n) for n in notes]
-        return Track(
+    def from_dict(data: dict) -> "Pattern":
+        return Pattern(
+            name=str(data.get("name", "Pattern")),
+            color=str(data.get("color", "#E6E6E6")),
+            length_beats=float(data.get("length_beats", 4.0)),
+            waveform=str(data.get("waveform", "square")),
+            gain=float(data.get("gain", 0.70)),
+            notes=[Note.from_dict(n) for n in data.get("notes", [])],
+        )
+
+
+@dataclass
+class PlaylistClip:
+    pattern_index: int
+    track_index: int
+    start_beat: float
+    duration_beats: float
+    muted: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "PlaylistClip":
+        return PlaylistClip(
+            pattern_index=int(data.get("pattern_index", 0)),
+            track_index=int(data.get("track_index", 0)),
+            start_beat=float(data.get("start_beat", 0.0)),
+            duration_beats=float(data.get("duration_beats", 4.0)),
+            muted=bool(data.get("muted", False)),
+        )
+
+
+@dataclass
+class PlaylistTrack:
+    name: str
+    color: str
+    muted: bool = False
+    solo: bool = False
+    clips: List[PlaylistClip] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name, "color": self.color,
+            "muted": self.muted, "solo": self.solo,
+            "clips": [c.to_dict() for c in self.clips],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "PlaylistTrack":
+        return PlaylistTrack(
             name=str(data.get("name", "Track")),
             color=str(data.get("color", "#E6E6E6")),
-            waveform=str(data.get("waveform", "square")),
-            gain=float(data.get("gain", 0.65)),
-            patterns=patterns,
+            muted=bool(data.get("muted", False)),
+            solo=bool(data.get("solo", False)),
+            clips=[PlaylistClip.from_dict(c) for c in data.get("clips", [])],
         )
 
 
 # ============================ SYNTH ENGINE ============================
 
 class ChiptuneSynth:
-    """Lightweight chiptune-ish poly synth for a prototype DAW."""
-
     def __init__(self, sample_rate: int = 44100, buffer_size: int = 512) -> None:
         self.sample_rate = sample_rate
         self.buffer_size = buffer_size
         self._voices: Dict[Hashable, dict] = {}
         self._lock = threading.Lock()
-
-        self.attack = 0.003
-        self.decay = 0.07
-        self.sustain = 0.65
-        self.release = 0.14
         self.master_gain = 0.22
 
     @staticmethod
     def midi_to_freq(pitch: int) -> float:
         return 440.0 * (2.0 ** ((pitch - 69) / 12.0))
 
-    def note_on(
-        self,
-        key: Hashable,
-        pitch: int,
-        velocity: float = 1.0,
-        waveform: str = "square",
-        gain: float = 0.6,
-    ) -> None:
+    def note_on(self, key: Hashable, pitch: int, velocity: float = 1.0,
+                waveform: str = "square", gain: float = 0.6) -> None:
         with self._lock:
             self._voices[key] = {
-                "pitch": pitch,
-                "freq": self.midi_to_freq(pitch),
-                "phase": 0.0,
+                "pitch": pitch, "freq": self.midi_to_freq(pitch), "phase": 0.0,
                 "velocity": float(max(0.0, min(1.0, velocity))),
-                "waveform": waveform,
-                "gain": float(max(0.0, min(1.25, gain))),
-                "env": 0.0,
-                "state": "attack",
+                "waveform": waveform, "gain": float(max(0.0, min(1.25, gain))),
+                "env": 0.0, "state": "attack",
             }
 
     def note_off(self, key: Hashable) -> None:
@@ -226,10 +215,9 @@ class ChiptuneSynth:
         out = np.zeros(frames, dtype=np.float32)
         sr = self.sample_rate
         dt = 1.0 / sr
-
-        attack_step = 1.0 / max(1, int(self.attack * sr))
-        decay_step = (1.0 - self.sustain) / max(1, int(self.decay * sr))
-        release_step = 1.0 / max(1, int(self.release * sr))
+        attack_step = 1.0 / max(1, int(0.003 * sr))
+        decay_step = (1.0 - 0.65) / max(1, int(0.07 * sr))
+        release_step = 1.0 / max(1, int(0.14 * sr))
 
         with self._lock:
             dead_keys: List[Hashable] = []
@@ -240,43 +228,327 @@ class ChiptuneSynth:
                 idx = np.arange(frames)
                 phases = (phase + phase_inc * idx) % (2.0 * np.pi)
                 wave = self._wave(str(voice["waveform"]), phases)
-
                 env = float(voice["env"])
                 state = str(voice["state"])
                 env_values = np.zeros(frames, dtype=np.float32)
                 for i in range(frames):
                     if state == "attack":
                         env += attack_step
-                        if env >= 1.0:
-                            env = 1.0
-                            state = "decay"
+                        if env >= 1.0: env = 1.0; state = "decay"
                     elif state == "decay":
                         env -= decay_step
-                        if env <= self.sustain:
-                            env = self.sustain
-                            state = "sustain"
+                        if env <= 0.65: env = 0.65; state = "sustain"
                     elif state == "sustain":
-                        env = self.sustain
+                        env = 0.65
                     elif state == "release":
                         env -= release_step
-                        if env <= 0.0:
-                            env = 0.0
-                            state = "dead"
+                        if env <= 0.0: env = 0.0; state = "dead"
                     env_values[i] = env
-
-                voice["env"] = env
-                voice["state"] = state
+                voice["env"] = env; voice["state"] = state
                 voice["phase"] = float((phase + phase_inc * frames) % (2.0 * np.pi))
-
                 out += wave * env_values * float(voice["velocity"]) * float(voice["gain"])
                 if state == "dead" or env <= 0.0001:
                     dead_keys.append(key)
-
             for key in dead_keys:
                 self._voices.pop(key, None)
 
         out = np.tanh(out * (self.master_gain * 2.4))
         return out.astype(np.float32)
+
+
+# ============================ PLAYLIST VIEW ============================
+
+class PlaylistView(QWidget):
+    pattern_double_clicked = Signal(int)
+
+    TRACK_HEIGHT = 42
+    TRACK_HEADER_W = 110
+    BEAT_W_BASE = 36.0
+    HEADER_H = 26
+    MIN_BEATS = 128
+
+    def __init__(self, daw: "Nill") -> None:
+        super().__init__()
+        self.daw = daw
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.selected_clip: Optional[Tuple[int, int]] = None
+        self.drag_mode: Optional[str] = None
+        self.drag_start_x = 0.0
+        self.drag_clip_start_beat = 0.0
+        self.drag_clip_duration = 4.0
+        self.drag_clip_track = 0
+        self.hover_clip: Optional[Tuple[int, int]] = None
+        self.zoom_x = 1.0
+        self._clip_cache: List[Tuple[int, int, PlaylistClip]] = []
+        self._cache_valid = False
+
+    @property
+    def BEAT_W(self) -> float:
+        return self.BEAT_W_BASE * self.zoom_x
+
+    def beat_to_x(self, beat: float) -> float:
+        return self.TRACK_HEADER_W + beat * self.BEAT_W
+
+    def x_to_beat(self, x: float) -> float:
+        return max(0.0, (x - self.TRACK_HEADER_W) / self.BEAT_W)
+
+    def total_beats(self) -> float:
+        max_beat = self.MIN_BEATS
+        for track in self.daw.playlist_tracks:
+            for clip in track.clips:
+                max_beat = max(max_beat, clip.start_beat + clip.duration_beats + 16)
+        return max_beat
+
+    def _invalidate_cache(self) -> None:
+        self._cache_valid = False
+
+    def _build_cache(self) -> None:
+        if self._cache_valid:
+            return
+        self._clip_cache = []
+        for t_idx, track in enumerate(self.daw.playlist_tracks):
+            for c_idx, clip in enumerate(track.clips):
+                self._clip_cache.append((t_idx, c_idx, clip))
+        self._clip_cache.sort(key=lambda x: x[2].start_beat)
+        self._cache_valid = True
+
+    def find_clip_at(self, x: float, y: float) -> Optional[Tuple[int, int, PlaylistClip]]:
+        if y < self.HEADER_H or x < self.TRACK_HEADER_W:
+            return None
+        track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+        if track_idx < 0 or track_idx >= len(self.daw.playlist_tracks):
+            return None
+        beat = self.x_to_beat(x)
+        for c_idx, clip in enumerate(self.daw.playlist_tracks[track_idx].clips):
+            if clip.start_beat <= beat < clip.start_beat + clip.duration_beats:
+                return (track_idx, c_idx, clip)
+        return None
+
+    def clip_rect(self, track_idx: int, clip: PlaylistClip) -> QRectF:
+        x = self.beat_to_x(clip.start_beat)
+        y = self.HEADER_H + track_idx * self.TRACK_HEIGHT + 2
+        w = max(4.0, clip.duration_beats * self.BEAT_W)
+        h = self.TRACK_HEIGHT - 4
+        return QRectF(x, y, w, h)
+
+    def sizeHint(self) -> QSize:
+        w = int(self.TRACK_HEADER_W + self.total_beats() * self.BEAT_W) + 100
+        h = self.HEADER_H + max(8, len(self.daw.playlist_tracks)) * self.TRACK_HEIGHT + 20
+        return QSize(w, h)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+
+        total_beats = self.total_beats()
+        num_tracks = len(self.daw.playlist_tracks)
+
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
+        painter.fillRect(0, 0, self.TRACK_HEADER_W, self.height(), QColor("#0A0A0A"))
+
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        for beat in range(int(total_beats) + 1):
+            x = self.beat_to_x(beat)
+            is_bar = beat % 4 == 0
+            color = QColor("#666") if is_bar else QColor("#333")
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
+            if is_bar and beat < total_beats:
+                painter.setPen(QColor("#AAA"))
+                painter.drawText(int(x + 4), 18, str(beat // 4 + 1))
+
+        for t_idx in range(num_tracks):
+            y = self.HEADER_H + t_idx * self.TRACK_HEIGHT
+            track = self.daw.playlist_tracks[t_idx]
+            bg = QColor("#111") if t_idx % 2 == 0 else QColor("#151515")
+            if track.muted:
+                bg = QColor("#080808")
+            painter.fillRect(self.TRACK_HEADER_W, y, int(self.beat_to_x(total_beats) - self.TRACK_HEADER_W), self.TRACK_HEIGHT, bg)
+
+            header_bg = QColor(track.color) if not track.muted else QColor("#222")
+            painter.fillRect(0, y, self.TRACK_HEADER_W, self.TRACK_HEIGHT, header_bg.darker(170))
+            painter.setPen(QPen(QColor(track.color if not track.muted else "#444"), 1))
+            painter.drawRect(0, y, self.TRACK_HEADER_W - 1, self.TRACK_HEIGHT - 1)
+            painter.setPen(QColor("#FFF" if not track.muted else "#555"))
+            painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+            painter.drawText(6, y + 16, track.name[:12])
+            painter.setFont(QFont("Consolas", 7))
+            if track.muted:
+                painter.setPen(QColor("#F44"))
+                painter.drawText(6, y + 30, "MUTED")
+            elif track.solo:
+                painter.setPen(QColor("#FC0"))
+                painter.drawText(6, y + 30, "SOLO")
+
+        for t_idx, track in enumerate(self.daw.playlist_tracks):
+            for c_idx, clip in enumerate(track.clips):
+                if clip.muted:
+                    continue
+                rect = self.clip_rect(t_idx, clip)
+                if not rect.intersects(event.rect()):
+                    continue
+                pattern = self.daw.patterns[clip.pattern_index]
+                fill = QColor(pattern.color)
+                if track.muted:
+                    fill = QColor("#222")
+                border = QColor("#DDD")
+                if self.selected_clip == (t_idx, c_idx):
+                    fill = fill.lighter(125)
+                    border = QColor("#FFF")
+                painter.fillRect(rect, fill)
+                painter.setPen(QPen(border, 1))
+                painter.drawRect(rect.adjusted(0, 0, -1, -1))
+                painter.setPen(QColor("#0A0A0A"))
+                painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+                txt = pattern.name[:max(3, int(rect.width() / 6))]
+                painter.drawText(rect.adjusted(4, 3, -4, 0), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, txt)
+                if rect.width() > 16:
+                    painter.setPen(QPen(QColor("#000"), 1, Qt.PenStyle.DotLine))
+                    painter.drawLine(int(rect.left() + 3), int(rect.top() + 5), int(rect.left() + 3), int(rect.bottom() - 5))
+                    painter.drawLine(int(rect.right() - 4), int(rect.top() + 5), int(rect.right() - 4), int(rect.bottom() - 5))
+
+        px = self.beat_to_x(self.daw.playhead_song_beat)
+        painter.setPen(QPen(QColor("#FFF"), 2))
+        painter.drawLine(int(px), self.HEADER_H, int(px), self.height())
+        painter.setBrush(QBrush(QColor("#FFF")))
+        tri = QPolygon([QPoint(int(px), self.HEADER_H), QPoint(int(px - 5), self.HEADER_H - 7), QPoint(int(px + 5), self.HEADER_H - 7)])
+        painter.drawPolygon(tri)
+
+        painter.setPen(QPen(QColor("#333"), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+    def mousePressEvent(self, event) -> None:
+        self.setFocus()
+        x = event.position().x()
+        y = event.position().y()
+
+        if x < self.TRACK_HEADER_W and y >= self.HEADER_H:
+            track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+            if 0 <= track_idx < len(self.daw.playlist_tracks):
+                if event.button() == Qt.MouseButton.RightButton:
+                    self.daw.show_track_context_menu(track_idx, event.globalPosition().toPoint())
+                else:
+                    self.daw.select_track(track_idx)
+            return
+
+        if y < self.HEADER_H:
+            return
+
+        result = self.find_clip_at(x, y)
+
+        if event.button() == Qt.MouseButton.RightButton:
+            if result:
+                t_idx, c_idx, _ = result
+                self.daw.playlist_tracks[t_idx].clips.pop(c_idx)
+                self.selected_clip = None
+                self._invalidate_cache()
+                self.update()
+            else:
+                track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+                if 0 <= track_idx < len(self.daw.playlist_tracks):
+                    beat = round(self.x_to_beat(x) * 4) / 4
+                    pat_idx = self.daw.selected_pattern_index
+                    pat = self.daw.patterns[pat_idx]
+                    new_clip = PlaylistClip(
+                        pattern_index=pat_idx, track_index=track_idx,
+                        start_beat=beat, duration_beats=pat.length_beats,
+                    )
+                    self.daw.playlist_tracks[track_idx].clips.append(new_clip)
+                    self.daw.playlist_tracks[track_idx].clips.sort(key=lambda c: c.start_beat)
+                    self._invalidate_cache()
+                    self.update()
+            return
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        if result:
+            t_idx, c_idx, clip = result
+            self.selected_clip = (t_idx, c_idx)
+            rect = self.clip_rect(t_idx, clip)
+            if abs(x - rect.left()) <= 6:
+                self.drag_mode = "resize_left"
+            elif abs(x - rect.right()) <= 6:
+                self.drag_mode = "resize_right"
+            else:
+                self.drag_mode = "move"
+            self.drag_start_x = x
+            self.drag_clip_start_beat = clip.start_beat
+            self.drag_clip_duration = clip.duration_beats
+            self.drag_clip_track = t_idx
+        else:
+            beat = self.x_to_beat(x)
+            self.daw.playhead_song_beat = max(0.0, beat)
+            self.selected_clip = None
+            self.drag_mode = None
+            self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        x = event.position().x()
+        y = event.position().y()
+
+        result = self.find_clip_at(x, y)
+        if result and x >= self.TRACK_HEADER_W:
+            t_idx, c_idx, clip = result
+            rect = self.clip_rect(t_idx, clip)
+            if abs(x - rect.left()) <= 6 or abs(x - rect.right()) <= 6:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.hover_clip = (t_idx, c_idx)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.hover_clip = None
+
+        if self.drag_mode and self.selected_clip:
+            t_idx, c_idx = self.selected_clip
+            clip = self.daw.playlist_tracks[t_idx].clips[c_idx]
+            delta_beats = (x - self.drag_start_x) / self.BEAT_W
+            snap = self.daw.current_snap
+
+            if self.drag_mode == "move":
+                new_start = self.drag_clip_start_beat + delta_beats
+                new_start = round(new_start / snap) * snap
+                clip.start_beat = max(0.0, new_start)
+                new_track = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+                if 0 <= new_track < len(self.daw.playlist_tracks) and new_track != t_idx:
+                    clip.track_index = new_track
+                    self.daw.playlist_tracks[t_idx].clips.pop(c_idx)
+                    self.daw.playlist_tracks[new_track].clips.append(clip)
+                    self.daw.playlist_tracks[new_track].clips.sort(key=lambda c: c.start_beat)
+                    self.selected_clip = (new_track, self.daw.playlist_tracks[new_track].clips.index(clip))
+                    self.drag_clip_track = new_track
+            elif self.drag_mode == "resize_right":
+                new_dur = self.drag_clip_duration + delta_beats
+                new_dur = max(snap, round(new_dur / snap) * snap)
+                clip.duration_beats = new_dur
+            elif self.drag_mode == "resize_left":
+                new_start = self.drag_clip_start_beat + delta_beats
+                new_start = round(new_start / snap) * snap
+                end = self.drag_clip_start_beat + self.drag_clip_duration
+                if new_start < end - snap:
+                    clip.start_beat = max(0.0, new_start)
+                    clip.duration_beats = end - clip.start_beat
+
+            self._invalidate_cache()
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.drag_mode = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        x = event.position().x()
+        y = event.position().y()
+        if x < self.TRACK_HEADER_W or y < self.HEADER_H:
+            return
+        result = self.find_clip_at(x, y)
+        if result:
+            _, _, clip = result
+            self.pattern_double_clicked.emit(clip.pattern_index)
 
 
 # ============================ PIANO ROLL ============================
@@ -286,18 +558,15 @@ class PianoRoll(QWidget):
 
     KEYBOARD_W = 92
     HEADER_H = 30
-    FOOTER_H = 0
-    # ROW_H and BEAT_W are responsive properties below so the piano roll fills the right side.
     MIN_MIDI = 36
     MAX_MIDI = 96
 
     def __init__(self, daw: "Nill") -> None:
         super().__init__()
         self.daw = daw
-        self.setMinimumSize(800, 500)
+        self.setMinimumSize(600, 300)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
         self.selected_note: Optional[Note] = None
         self.drag_mode: Optional[str] = None
         self.drag_note_start_beat = 0.0
@@ -305,53 +574,49 @@ class PianoRoll(QWidget):
         self.drag_origin_beat = 0.0
         self.drag_origin_pitch = 60
         self.preview_key: Optional[str] = None
-
-        self._hover_note: Optional[Note] = None
+        self.zoom_x = 1.0
+        self.zoom_y = 1.0
 
     @property
     def total_rows(self) -> int:
         return self.MAX_MIDI - self.MIN_MIDI + 1
 
     def is_black(self, pitch: int) -> bool:
-        return pitch % 12 in BLACK_PITCH_CLASSES
+        return pitch % 12 in {1, 3, 6, 8, 10}
 
     def note_name(self, pitch: int) -> str:
         octave = (pitch // 12) - 1
         return f"{NOTE_NAMES[pitch % 12]}{octave}"
 
-    def beat_to_x(self, beat: float) -> float:
-        return self.KEYBOARD_W + beat * self.BEAT_W
-
-    def pitch_to_y(self, pitch: int) -> float:
-        row = self.MAX_MIDI - pitch
-        return self.HEADER_H + row * self.ROW_H
-
     @property
     def BEAT_W(self) -> float:
-        # Horizontal piano-roll zoom only: expand beat spacing inside the scroll area.
-        if self.daw.pattern_length_beats <= 0:
+        pat = self.daw.current_pattern()
+        if pat.length_beats <= 0:
             return 40.0
-        viewport_width = self.width()
+        vw = self.width()
         scroll = getattr(self.daw, "piano_scroll", None)
-        if scroll is not None:
-            viewport_width = scroll.viewport().width()
-        available = max(100.0, float(viewport_width - self.KEYBOARD_W))
-        fit_width = max(12.0, available / float(self.daw.pattern_length_beats))
-        return fit_width * float(getattr(self.daw, "zoom_x", 1.0))
+        if scroll: vw = scroll.viewport().width()
+        available = max(100.0, float(vw - self.KEYBOARD_W))
+        fit = max(12.0, available / float(pat.length_beats))
+        return fit * self.zoom_x
 
     @property
     def ROW_H(self) -> float:
-        # Vertical piano-roll zoom only: makes rows and note blocks taller inside the scroll area.
-        viewport_height = self.height()
+        vh = self.height()
         scroll = getattr(self.daw, "piano_scroll", None)
-        if scroll is not None:
-            viewport_height = scroll.viewport().height()
-        available = max(200.0, float(viewport_height - self.HEADER_H - self.FOOTER_H))
-        fit_height = max(10.0, available / float(self.total_rows))
-        return fit_height * float(getattr(self.daw, "zoom_y", 1.0))
+        if scroll: vh = scroll.viewport().height()
+        available = max(200.0, float(vh - self.HEADER_H))
+        fit = max(10.0, available / float(self.total_rows))
+        return fit * self.zoom_y
+
+    def beat_to_x(self, beat: float) -> float:
+        return self.KEYBOARD_W + beat * self.BEAT_W
 
     def x_to_beat(self, x: float) -> float:
         return max(0.0, (x - self.KEYBOARD_W) / self.BEAT_W)
+
+    def pitch_to_y(self, pitch: int) -> float:
+        return self.HEADER_H + (self.MAX_MIDI - pitch) * self.ROW_H
 
     def y_to_pitch(self, y: float) -> int:
         row = int((y - self.HEADER_H) / self.ROW_H)
@@ -365,263 +630,159 @@ class PianoRoll(QWidget):
         h = self.ROW_H - 2
         return QRectF(x, y, w, h)
 
-    def current_notes(self) -> List[Note]:
-        return self.daw.current_notes()
-
-    def ghost_notes(self) -> List[Tuple[Track, Note]]:
-        return self.daw.ghost_notes_for_current_pattern()
-
     def snap_value(self, value: float) -> float:
         snap = self.daw.current_snap
-        if snap <= 0.0:
-            return value
+        if snap <= 0.0: return value
         return round(value / snap) * snap
 
-    def pitch_in_scale(self, pitch: int) -> bool:
-        scale = SCALE_INTERVALS.get(self.daw.scale_mode, set(range(12)))
-        root_pc = NOTE_NAMES.index(self.daw.scale_root)
-        relative_pc = (pitch - root_pc) % 12
-        return relative_pc in scale
-
-    def find_note_at(self, pos_x: float, pos_y: float) -> Optional[Note]:
-        for note in reversed(self.current_notes()):
-            if self.note_rect(note).contains(pos_x, pos_y):
+    def find_note_at(self, x: float, y: float) -> Optional[Note]:
+        for note in reversed(self.daw.current_pattern().notes):
+            if self.note_rect(note).contains(x, y):
                 return note
         return None
-
-    def _remove_note(self, note: Note) -> None:
-        notes = self.current_notes()
-        if note in notes:
-            notes.remove(note)
-            if self.selected_note is note:
-                self.selected_note = None
-            self.note_changed.emit()
-            self.update()
-
-    def _insert_note_or_stamp(self, beat: float, pitch: int) -> Optional[Note]:
-        notes = self.current_notes()
-        duration = self.daw.default_note_length
-        inserted_root: Optional[Note] = None
-
-        for interval in STAMP_INTERVALS.get(self.daw.stamp_mode, [0]):
-            new_pitch = pitch + interval
-            if new_pitch < self.MIN_MIDI or new_pitch > self.MAX_MIDI:
-                continue
-            duplicate = next(
-                (
-                    n
-                    for n in notes
-                    if n.pitch == new_pitch and abs(n.start - beat) < 0.001 and abs(n.duration - duration) < 0.001
-                ),
-                None,
-            )
-            if duplicate:
-                continue
-            new_note = Note(pitch=new_pitch, start=beat, duration=duration, velocity=105)
-            notes.append(new_note)
-            if inserted_root is None:
-                inserted_root = new_note
-
-        notes.sort(key=lambda n: (n.start, n.pitch))
-        self.note_changed.emit()
-        self.update()
-        return inserted_root
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.fillRect(self.rect(), QColor("#0B0B0B"))
 
-        pattern_len = self.daw.pattern_length_beats
-        grid_right = self.beat_to_x(pattern_len)
+        pat = self.daw.current_pattern()
+        grid_right = self.beat_to_x(pat.length_beats)
 
-        # Header / ruler
         painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
         painter.fillRect(0, 0, self.KEYBOARD_W, self.height(), QColor("#050505"))
 
-        # Row backgrounds + piano keys
         for pitch in range(self.MAX_MIDI, self.MIN_MIDI - 1, -1):
             y = self.pitch_to_y(pitch)
             row_rect = QRectF(self.KEYBOARD_W, y, max(0, grid_right - self.KEYBOARD_W), self.ROW_H)
             key_rect = QRectF(0, y, self.KEYBOARD_W, self.ROW_H)
-
             if self.is_black(pitch):
-                key_color = QColor("#202020")
-                row_color = QColor("#141414")
+                key_color, row_color = QColor("#202020"), QColor("#141414")
             else:
-                key_color = QColor("#E6E6E6")
-                row_color = QColor("#181818")
-
-            if self.daw.scale_mode != "Chromatic" and self.pitch_in_scale(pitch):
-                row_color = QColor(row_color)
-                row_color.setAlpha(255)
-                row_color = row_color.lighter(116)
-
+                key_color, row_color = QColor("#E6E6E6"), QColor("#181818")
             painter.fillRect(row_rect, row_color)
             painter.fillRect(key_rect, key_color)
-
             painter.setPen(QPen(QColor("#2A2A2A"), 1))
             painter.drawLine(int(self.KEYBOARD_W), int(y), int(grid_right), int(y))
             painter.setPen(QPen(QColor("#0F0F0F"), 1))
             painter.drawRect(key_rect)
-
-            label_color = QColor("#111111") if not self.is_black(pitch) else QColor("#E4E4E4")
+            label_color = QColor("#111") if not self.is_black(pitch) else QColor("#E4E4E4")
             painter.setPen(label_color)
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(key_rect.adjusted(6, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.note_name(pitch))
 
-        # Vertical grid
         snap = self.daw.current_snap
-        if snap <= 0.0:
-            snap = 0.25
-        steps = int(pattern_len / snap) + 1
+        if snap <= 0.0: snap = 0.25
+        steps = int(pat.length_beats / snap) + 1
         for i in range(steps + 1):
             beat = i * snap
             x = self.beat_to_x(beat)
-            if i % int(max(1, round(1.0 / snap))) == 0:
-                color = QColor("#3A3A3A")
-            else:
-                color = QColor("#262626")
-            if abs(beat % 4.0) < 0.001:
-                color = QColor("#555555")
+            color = QColor("#555") if abs(beat % 4.0) < 0.001 else (QColor("#3A3A3A") if i % int(max(1, round(1.0/snap))) == 0 else QColor("#262626"))
             painter.setPen(QPen(color, 1))
             painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
 
-        # Header beat labels
         painter.setPen(QPen(QColor("#C8C8C8"), 1))
         painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        for beat in range(int(pattern_len) + 1):
+        for beat in range(int(pat.length_beats) + 1):
             x = self.beat_to_x(beat)
             painter.drawLine(int(x), 0, int(x), self.HEADER_H)
-            if beat < pattern_len:
-                painter.drawText(int(x + 4), 20, f"{beat + 1}")
+            if beat < pat.length_beats:
+                painter.drawText(int(x + 4), 20, str(beat + 1))
 
-        painter.setPen(QPen(QColor("#777777"), 1))
+        painter.setPen(QColor("#777"))
         painter.drawText(10, 20, "PIANO")
-        painter.drawText(self.KEYBOARD_W + 8, 20, f"Pattern {self.daw.current_pattern + 1} / {self.daw.pattern_count} | Track: {self.daw.current_track().name}")
+        painter.drawText(self.KEYBOARD_W + 8, 20, f"Pattern: {pat.name} [{pat.waveform}]")
 
-        # Ghost notes
-        if self.daw.show_ghosts:
-            for track, note in self.ghost_notes():
-                rect = self.note_rect(note)
-                ghost_fill = QColor(track.color)
-                ghost_fill.setAlpha(55)
-                ghost_border = QColor(track.color)
-                ghost_border.setAlpha(110)
-                painter.fillRect(rect, ghost_fill)
-                painter.setPen(QPen(ghost_border, 1, Qt.PenStyle.DashLine))
-                painter.drawRect(rect)
-
-        # Current track notes
-        for note in self.current_notes():
+        for note in pat.notes:
             rect = self.note_rect(note)
-            fill = QColor(self.daw.current_track().color)
-            if note.muted:
-                fill = QColor("#5F5F5F")
+            fill = QColor(pat.color)
+            if note.muted: fill = QColor("#5F5F5F")
             border = QColor("#F4F4F4")
             if self.selected_note is note:
                 fill = fill.lighter(135)
-                border = QColor("#FFFFFF")
-
+                border = QColor("#FFF")
             painter.fillRect(rect, fill)
             painter.setPen(QPen(border, 1))
             painter.drawRect(rect)
-
             painter.setPen(QPen(QColor("#0A0A0A"), 1))
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.note_name(note.pitch))
 
-        # Playhead
         if self.daw.playing:
-            play_x = self.beat_to_x(self.daw.current_visible_local_beat())
-            painter.setPen(QPen(QColor("#FFFFFF"), 2))
-            painter.drawLine(int(play_x), self.HEADER_H, int(play_x), self.height())
+            local = self.daw.playhead_song_beat % pat.length_beats
+            px = self.beat_to_x(local)
+            painter.setPen(QPen(QColor("#FFF"), 2))
+            painter.drawLine(int(px), self.HEADER_H, int(px), self.height())
 
-        # Border
         painter.setPen(QPen(QColor("#4A4A4A"), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         pos = event.position()
-        x = pos.x()
-        y = pos.y()
-
+        x, y = pos.x(), pos.y()
         if y < self.HEADER_H:
             return
-
-        # Preview from piano keyboard area
         if x < self.KEYBOARD_W and event.button() == Qt.MouseButton.LeftButton:
             pitch = self.y_to_pitch(y)
             self.preview_key = f"preview-{time.time_ns()}"
             self.daw.preview_note_on(self.preview_key, pitch)
             return
-
-        clicked_note = self.find_note_at(x, y)
-        self.selected_note = clicked_note
-
+        clicked = self.find_note_at(x, y)
+        self.selected_note = clicked
         if event.button() == Qt.MouseButton.RightButton:
-            if clicked_note is not None:
-                self._remove_note(clicked_note)
-            else:
+            if clicked:
+                self.daw.current_pattern().notes.remove(clicked)
                 self.selected_note = None
+                self.note_changed.emit()
                 self.update()
-                self.daw.show_grid_menu(event.globalPosition().toPoint())
             return
-
         if event.button() != Qt.MouseButton.LeftButton:
             return
-
         beat = self.snap_value(self.x_to_beat(x))
-        beat = max(0.0, min(self.daw.pattern_length_beats - self.daw.current_snap, beat))
+        beat = max(0.0, min(self.daw.current_pattern().length_beats - self.daw.current_snap, beat))
         pitch = self.y_to_pitch(y)
-
-        if clicked_note is not None:
-            rect = self.note_rect(clicked_note)
+        if clicked:
+            rect = self.note_rect(clicked)
             self.drag_mode = "resize" if (rect.right() - x) <= 8 else "move"
             self.drag_origin_beat = beat
             self.drag_origin_pitch = pitch
-            self.drag_note_start_beat = clicked_note.start
-            self.drag_note_start_pitch = clicked_note.pitch
+            self.drag_note_start_beat = clicked.start
+            self.drag_note_start_pitch = clicked.pitch
         else:
-            inserted = self._insert_note_or_stamp(beat, pitch)
-            self.selected_note = inserted
+            new_note = Note(pitch=pitch, start=beat, duration=self.daw.default_note_length, velocity=100)
+            self.daw.current_pattern().notes.append(new_note)
+            self.selected_note = new_note
+            self.daw.current_pattern().notes.sort(key=lambda n: (n.start, n.pitch))
             self.drag_mode = None
-
+            self.note_changed.emit()
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position()
-        x = pos.x()
-        y = pos.y()
-
-        note_under_cursor = self.find_note_at(x, y) if x >= self.KEYBOARD_W else None
-        self._hover_note = note_under_cursor
-
-        if self.drag_mode and self.selected_note is not None:
+        x, y = pos.x(), pos.y()
+        note_under = self.find_note_at(x, y) if x >= self.KEYBOARD_W else None
+        if self.drag_mode and self.selected_note:
             beat = self.snap_value(self.x_to_beat(x))
-            beat = max(0.0, min(self.daw.pattern_length_beats, beat))
+            beat = max(0.0, min(self.daw.current_pattern().length_beats, beat))
             pitch = self.y_to_pitch(y)
-
             if self.drag_mode == "move":
-                delta_beats = beat - self.drag_origin_beat
-                delta_pitch = pitch - self.drag_origin_pitch
-                new_start = max(0.0, self.drag_note_start_beat + delta_beats)
-                new_start = min(self.daw.pattern_length_beats - self.selected_note.duration, new_start)
-                self.selected_note.start = self.snap_value(new_start)
-                self.selected_note.pitch = max(self.MIN_MIDI, min(self.MAX_MIDI, self.drag_note_start_pitch + delta_pitch))
+                delta_b = beat - self.drag_origin_beat
+                delta_p = pitch - self.drag_origin_pitch
+                new_s = max(0.0, self.drag_note_start_beat + delta_b)
+                new_s = min(self.daw.current_pattern().length_beats - self.selected_note.duration, new_s)
+                self.selected_note.start = self.snap_value(new_s)
+                self.selected_note.pitch = max(self.MIN_MIDI, min(self.MAX_MIDI, self.drag_note_start_pitch + delta_p))
             elif self.drag_mode == "resize":
-                new_duration = max(self.daw.current_snap, beat - self.selected_note.start)
-                max_duration = self.daw.pattern_length_beats - self.selected_note.start
-                self.selected_note.duration = min(max_duration, self.snap_value(new_duration))
-
+                new_d = max(self.daw.current_snap, beat - self.selected_note.start)
+                max_d = self.daw.current_pattern().length_beats - self.selected_note.start
+                self.selected_note.duration = min(max_d, self.snap_value(new_d))
             self.note_changed.emit()
             self.update()
         else:
-            if note_under_cursor is not None:
-                rect = self.note_rect(note_under_cursor)
-                near_edge = (rect.right() - x) <= 8
-                self.setCursor(Qt.CursorShape.SizeHorCursor if near_edge else Qt.CursorShape.OpenHandCursor)
+            if note_under:
+                rect = self.note_rect(note_under)
+                self.setCursor(Qt.CursorShape.SizeHorCursor if (rect.right() - x) <= 8 else Qt.CursorShape.OpenHandCursor)
             elif x < self.KEYBOARD_W:
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
@@ -630,19 +791,21 @@ class PianoRoll(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         self.drag_mode = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        if self.preview_key is not None:
+        if self.preview_key:
             self.daw.preview_note_off(self.preview_key)
             self.preview_key = None
 
     def leaveEvent(self, event) -> None:
-        if self.preview_key is not None:
+        if self.preview_key:
             self.daw.preview_note_off(self.preview_key)
             self.preview_key = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def delete_selected(self) -> None:
-        if self.selected_note is not None:
-            self._remove_note(self.selected_note)
+        if self.selected_note and self.selected_note in self.daw.current_pattern().notes:
+            self.daw.current_pattern().notes.remove(self.selected_note)
+            self.selected_note = None
+            self.note_changed.emit()
+            self.update()
 
 
 # ============================ MAIN WINDOW ============================
@@ -650,47 +813,34 @@ class PianoRoll(QWidget):
 class Nill(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("FIXESNEEDED | Black & White Terminal UI")
-        self.resize(1400, 850)
-        self.setMinimumSize(1000, 600)
+        self.setWindowTitle("NILL | FL-Style Playlist DAW")
+        self.resize(1600, 950)
+        self.setMinimumSize(1200, 700)
 
-        self.pattern_count = 8
-        self.current_pattern = 0
-        self.pattern_length_beats = 8
         self.bpm = 140
-        self.scale_root = "C"
-        self.scale_mode = "Minor"
         self.current_snap = 0.25
         self.default_note_length = 1.0
-        self.stamp_mode = "Single"
-        self.show_ghosts = True
         self.playing = False
-        # Piano-roll zoom only: affects the note grid/note blocks, not sidebar/buttons/UI widgets.
-        self.zoom_x = 1.0
-        self.zoom_y = 1.0
-        self.loop_mode = "Pattern"
-        self.song_order = list(range(self.pattern_count))
         self.playhead_song_beat = 0.0
         self._last_playback_time = time.perf_counter()
         self._last_active_keys: set = set()
         self._preview_keys: set = set()
-        self.visualizer_process = None
         self.osc_process = None
+        self.visualizer_process = None
 
         self.synth = ChiptuneSynth()
         self.stream = None
         self._start_audio()
 
-        self.tracks: List[Track] = []
-        self.selected_track_index = 0
-        self._build_default_tracks()
+        self.patterns: List[Pattern] = []
+        self.selected_pattern_index = 0
+        self._build_default_patterns()
 
-        self._pattern_buttons: List[QPushButton] = []
+        self.playlist_tracks: List[PlaylistTrack] = []
+        self._build_default_tracks()
 
         self._build_ui()
         self._bind_shortcuts()
-        self.refresh_track_list()
-        self.refresh_track_controls()
         self.refresh_pattern_buttons()
 
         self.playback_timer = QTimer(self)
@@ -698,27 +848,60 @@ class Nill(QMainWindow):
         self.playback_timer.timeout.connect(self.update_playback)
         self.playback_timer.start()
 
-    # -------------------------- Setup --------------------------
+    def _build_default_patterns(self) -> None:
+        defaults = [
+            ("Kick", PATTERN_COLORS[0], "square", 36, 4.0),
+            ("Snare", PATTERN_COLORS[1], "noise", 50, 4.0),
+            ("Hat", PATTERN_COLORS[2], "triangle", 62, 4.0),
+            ("Bass", PATTERN_COLORS[3], "saw", 48, 8.0),
+            ("Lead", PATTERN_COLORS[4], "square", 60, 8.0),
+            ("Chord", PATTERN_COLORS[5], "saw", 60, 8.0),
+            ("ARP", PATTERN_COLORS[6], "triangle", 72, 4.0),
+            ("FX", PATTERN_COLORS[7], "noise", 80, 4.0),
+        ]
+        for name, color, wave, base_pitch, length in defaults:
+            pat = Pattern(name=name, color=color, waveform=wave, length_beats=length)
+            if "Kick" in name:
+                for b in range(0, 16, 4):
+                    pat.notes.append(Note(pitch=36, start=b/4.0, duration=0.5))
+            elif "Snare" in name:
+                for b in [2, 6, 10, 14]:
+                    pat.notes.append(Note(pitch=50, start=b/4.0, duration=0.3))
+            elif "Hat" in name:
+                for b in range(16):
+                    pat.notes.append(Note(pitch=62, start=b/4.0, duration=0.15))
+            elif "Bass" in name:
+                pat.notes.append(Note(pitch=48, start=0, duration=2))
+                pat.notes.append(Note(pitch=36, start=2, duration=2))
+                pat.notes.append(Note(pitch=43, start=4, duration=2))
+                pat.notes.append(Note(pitch=41, start=6, duration=2))
+            elif "Lead" in name:
+                pat.notes.append(Note(pitch=60, start=0, duration=1))
+                pat.notes.append(Note(pitch=62, start=1, duration=1))
+                pat.notes.append(Note(pitch=64, start=2, duration=1))
+                pat.notes.append(Note(pitch=67, start=3, duration=1))
+            self.patterns.append(pat)
 
     def _build_default_tracks(self) -> None:
-        defaults = [
-            ("Lead", DEFAULT_TRACK_COLORS[0], "square"),
-            ("Bass", DEFAULT_TRACK_COLORS[1], "triangle"),
-            ("Chord", DEFAULT_TRACK_COLORS[2], "saw"),
-        ]
-        for name, color, waveform in defaults:
-            self.tracks.append(Track(name=name, color=color, waveform=waveform, gain=0.70))
+        for i in range(8):
+            color = PATTERN_COLORS[i % len(PATTERN_COLORS)]
+            self.playlist_tracks.append(PlaylistTrack(name=f"Track {i+1}", color=color))
+        for t_idx in range(min(4, len(self.patterns))):
+            for bar in range(4):
+                clip = PlaylistClip(
+                    pattern_index=t_idx, track_index=t_idx,
+                    start_beat=bar * 4.0, duration_beats=self.patterns[t_idx].length_beats,
+                )
+                self.playlist_tracks[t_idx].clips.append(clip)
 
     def _start_audio(self) -> None:
         if sd is None:
-            print("sounddevice not available. Visual editor still works.")
+            print("sounddevice not available.")
             return
         try:
             self.stream = sd.OutputStream(
-                samplerate=self.synth.sample_rate,
-                channels=1,
-                blocksize=self.synth.buffer_size,
-                callback=self.audio_callback,
+                samplerate=self.synth.sample_rate, channels=1,
+                blocksize=self.synth.buffer_size, callback=self.audio_callback,
             )
             self.stream.start()
             print("Audio engine started.")
@@ -727,377 +910,378 @@ class Nill(QMainWindow):
             print("Audio startup failed:", exc)
 
     def audio_callback(self, outdata, frames, time_info, status) -> None:
-        if status:
-            print(status)
+        if status: print(status)
         audio = self.synth.generate_audio(frames)
         outdata[:, 0] = np.clip(audio, -0.97, 0.97)
 
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(10)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(6)
 
-        # Sidebar
-        sidebar = QWidget()
-        sidebar.setFixedWidth(340)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setSpacing(8)
+        top_bar = QWidget()
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(6)
 
-        title = QLabel("NILL // TERMINAL")
-        title.setFont(QFont("Consolas", 15, QFont.Weight.Bold))
-        title.setStyleSheet("color:#FFFFFF; padding: 6px 0; letter-spacing: 1px;")
-        sidebar_layout.addWidget(title)
+        top_layout.addWidget(QLabel("PATTERN:"))
+        self._pattern_buttons: List[QPushButton] = []
+        for i in range(len(self.patterns)):
+            btn = QPushButton(f"P{i+1}")
+            btn.setCheckable(True)
+            btn.setFixedWidth(36)
+            btn.clicked.connect(lambda checked=False, idx=i: self.set_selected_pattern(idx))
+            self._pattern_buttons.append(btn)
+            top_layout.addWidget(btn)
 
-        subtitle = QLabel("Black-and-white terminal style pattern DAW with an FL-style piano roll.")
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color:#BDBDBD;")
-        sidebar_layout.addWidget(subtitle)
-
-        transport_grid = QGridLayout()
         self.play_btn = QPushButton("○")
         self.play_btn.setCheckable(True)
         self.play_btn.setObjectName("transportCircle")
-        self.play_btn.setFixedSize(48, 48)
-        self.play_btn.setToolTip("Play / Stop sequence (Space)")
+        self.play_btn.setFixedSize(40, 40)
         self.play_btn.clicked.connect(self.toggle_playback)
-        transport_grid.addWidget(self.play_btn, 0, 0, 2, 1, Qt.AlignmentFlag.AlignLeft)
-        space_hint = QLabel("SPACE\nPLAY / STOP")
-        space_hint.setStyleSheet("color:#BDBDBD;")
-        transport_grid.addWidget(space_hint, 0, 1, 2, 1)
+        top_layout.addWidget(self.play_btn)
+        top_layout.addWidget(QLabel("SPACE"))
 
         self.bpm_spin = QSpinBox()
         self.bpm_spin.setRange(40, 260)
         self.bpm_spin.setValue(self.bpm)
         self.bpm_spin.valueChanged.connect(self.on_bpm_changed)
-        transport_grid.addWidget(QLabel("BPM"), 2, 0)
-        transport_grid.addWidget(self.bpm_spin, 2, 1)
-
-        self.loop_mode_combo = QComboBox()
-        self.loop_mode_combo.addItems(["Pattern", "Song"])
-        self.loop_mode_combo.currentTextChanged.connect(self.on_loop_mode_changed)
-        transport_grid.addWidget(QLabel("Loop"), 3, 0)
-        transport_grid.addWidget(self.loop_mode_combo, 3, 1)
-
-        self.pattern_len_spin = QSpinBox()
-        self.pattern_len_spin.setRange(4, 32)
-        self.pattern_len_spin.setSingleStep(4)
-        self.pattern_len_spin.setValue(self.pattern_length_beats)
-        self.pattern_len_spin.valueChanged.connect(self.on_pattern_length_changed)
-        transport_grid.addWidget(QLabel("Pattern Beats"), 4, 0)
-        transport_grid.addWidget(self.pattern_len_spin, 4, 1)
+        top_layout.addWidget(QLabel("BPM:"))
+        top_layout.addWidget(self.bpm_spin)
 
         self.snap_combo = QComboBox()
-        self.snap_combo.addItem("1 Beat", 1.0)
-        self.snap_combo.addItem("1/2", 0.5)
         self.snap_combo.addItem("1/4", 0.25)
         self.snap_combo.addItem("1/8", 0.125)
         self.snap_combo.addItem("1/16", 0.0625)
-        self.snap_combo.addItem("1/32", 0.03125)
-        self.snap_combo.setCurrentIndex(2)
+        self.snap_combo.addItem("1/2", 0.5)
+        self.snap_combo.addItem("1", 1.0)
+        self.snap_combo.setCurrentIndex(0)
         self.snap_combo.currentIndexChanged.connect(self.on_snap_changed)
-        transport_grid.addWidget(QLabel("Snap"), 5, 0)
-        transport_grid.addWidget(self.snap_combo, 5, 1)
+        top_layout.addWidget(QLabel("Snap:"))
+        top_layout.addWidget(self.snap_combo)
 
-        self.note_len_combo = QComboBox()
-        self.note_len_combo.addItem("1/8", 0.125)
-        self.note_len_combo.addItem("1/4", 0.25)
-        self.note_len_combo.addItem("1/2", 0.5)
-        self.note_len_combo.addItem("1", 1.0)
-        self.note_len_combo.addItem("2", 2.0)
-        self.note_len_combo.setCurrentIndex(3)
-        self.note_len_combo.currentIndexChanged.connect(self.on_note_length_changed)
-        transport_grid.addWidget(QLabel("Draw Length"), 6, 0)
-        transport_grid.addWidget(self.note_len_combo, 6, 1)
+        top_layout.addWidget(QLabel("Zoom:"))
+        zout = QPushButton("-")
+        zin = QPushButton("+")
+        zreset = QPushButton("Reset")
+        zout.setFixedWidth(28); zin.setFixedWidth(28); zreset.setFixedWidth(50)
+        zout.clicked.connect(lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 0.8))
+        zin.clicked.connect(lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 1.25))
+        zreset.clicked.connect(lambda: self.set_playlist_zoom(1.0))
+        top_layout.addWidget(zout)
+        top_layout.addWidget(zreset)
+        top_layout.addWidget(zin)
 
-        self.scale_root_combo = QComboBox()
-        self.scale_root_combo.addItems(NOTE_NAMES)
-        self.scale_root_combo.setCurrentText(self.scale_root)
-        self.scale_root_combo.currentTextChanged.connect(self.on_scale_changed)
-        transport_grid.addWidget(QLabel("Scale Root"), 7, 0)
-        transport_grid.addWidget(self.scale_root_combo, 7, 1)
-
-        self.scale_mode_combo = QComboBox()
-        self.scale_mode_combo.addItems(list(SCALE_INTERVALS.keys()))
-        self.scale_mode_combo.setCurrentText(self.scale_mode)
-        self.scale_mode_combo.currentTextChanged.connect(self.on_scale_changed)
-        transport_grid.addWidget(QLabel("Scale"), 8, 0)
-        transport_grid.addWidget(self.scale_mode_combo, 8, 1)
-
-        self.stamp_combo = QComboBox()
-        self.stamp_combo.addItems(list(STAMP_INTERVALS.keys()))
-        self.stamp_combo.currentTextChanged.connect(self.on_stamp_changed)
-        transport_grid.addWidget(QLabel("Stamp / Chord"), 9, 0)
-        transport_grid.addWidget(self.stamp_combo, 9, 1)
-
-        self.ghosts_check = QCheckBox("Show Ghost Notes")
-        self.ghosts_check.setChecked(self.show_ghosts)
-        self.ghosts_check.toggled.connect(self.on_ghosts_toggled)
-        transport_grid.addWidget(self.ghosts_check, 10, 0, 1, 2)
-
-        sidebar_layout.addLayout(transport_grid)
-
-        sidebar_layout.addWidget(QLabel("Tracks / Channel Rack"))
-        self.track_list = QListWidget()
-        self.track_list.currentRowChanged.connect(self.on_track_selected)
-        sidebar_layout.addWidget(self.track_list, 1)
-
-        track_btns = QHBoxLayout()
-        add_track_btn = QPushButton("+ Add Track")
-        remove_track_btn = QPushButton("- Remove")
-        add_track_btn.clicked.connect(self.add_track)
-        remove_track_btn.clicked.connect(self.remove_track)
-        track_btns.addWidget(add_track_btn)
-        track_btns.addWidget(remove_track_btn)
-        sidebar_layout.addLayout(track_btns)
-
-        sidebar_layout.addWidget(QLabel("Selected Track"))
-        props = QGridLayout()
-
-        self.track_name_edit = QLineEdit()
-        self.track_name_edit.editingFinished.connect(self.on_track_name_edited)
-        props.addWidget(QLabel("Name"), 0, 0)
-        props.addWidget(self.track_name_edit, 0, 1)
-
-        self.track_wave_combo = QComboBox()
-        self.track_wave_combo.addItems(["square", "triangle", "saw", "sine", "noise"])
-        self.track_wave_combo.currentTextChanged.connect(self.on_track_wave_changed)
-        props.addWidget(QLabel("Waveform"), 1, 0)
-        props.addWidget(self.track_wave_combo, 1, 1)
-
-        self.track_gain_spin = QDoubleSpinBox()
-        self.track_gain_spin.setRange(0.05, 1.25)
-        self.track_gain_spin.setSingleStep(0.05)
-        self.track_gain_spin.setValue(0.70)
-        self.track_gain_spin.valueChanged.connect(self.on_track_gain_changed)
-        props.addWidget(QLabel("Gain"), 2, 0)
-        props.addWidget(self.track_gain_spin, 2, 1)
-
-        sidebar_layout.addLayout(props)
-
-        save_load = QHBoxLayout()
-        save_btn = QPushButton("Save Project")
-        load_btn = QPushButton("Load Project")
-        save_btn.clicked.connect(self.save_project)
-        load_btn.clicked.connect(self.load_project)
-        save_load.addWidget(save_btn)
-        save_load.addWidget(load_btn)
-        sidebar_layout.addLayout(save_load)
-
-        help_text = QLabel(
-            "Left click: draw/select note\n"
-            "Drag note: move\n"
-            "Drag note edge: resize\n"
-            "Right click note: delete\n"
-            "Click piano keys: preview notes\n"
-            "Ghost notes show other tracks in the same pattern"
-        )
-        help_text.setStyleSheet("color:#A0A0A0;")
-        sidebar_layout.addWidget(help_text)
-
-        outer.addWidget(sidebar)
-
-        # Main editor area
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
-
-        pattern_bar = QWidget()
-        pattern_layout = QHBoxLayout(pattern_bar)
-        pattern_layout.setContentsMargins(0, 0, 0, 0)
-        pattern_layout.setSpacing(6)
-        pattern_layout.addWidget(QLabel("Patterns"))
-        for i in range(self.pattern_count):
-            btn = QPushButton(f"P{i + 1}")
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda checked=False, idx=i: self.set_current_pattern(idx))
-            self._pattern_buttons.append(btn)
-            pattern_layout.addWidget(btn)
-
-        command_prompt = QLabel(">")
-        command_prompt.setStyleSheet("color:#FFFFFF; font-weight:bold;")
-        pattern_layout.addWidget(command_prompt)
+        top_layout.addWidget(QLabel(">"))
         self.command_line = QLineEdit()
         self.command_line.setPlaceholderText("set bpm ___ | show osc | show visualizer")
         self.command_line.setMinimumWidth(260)
         self.command_line.setToolTip("Commands: set bpm ___, show osc, show visualizer")
         self.command_line.returnPressed.connect(self.run_command_line)
-        command_completer = QCompleter(["set bpm ", "show osc", "show visualizer"], self.command_line)
-        command_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.command_line.setCompleter(command_completer)
-        pattern_layout.addWidget(self.command_line, 1)
+        top_layout.addWidget(self.command_line, 1)
 
-        pattern_layout.addWidget(QLabel("Zoom"))
-        self.zoom_out_btn = QPushButton("-")
-        self.zoom_in_btn = QPushButton("+")
-        self.zoom_reset_btn = QPushButton("100%")
-        self.zoom_out_btn.setToolTip("Zoom piano roll out")
-        self.zoom_in_btn.setToolTip("Zoom piano roll in")
-        self.zoom_reset_btn.setToolTip("Reset piano roll zoom")
-        self.zoom_out_btn.clicked.connect(self.zoom_out)
-        self.zoom_in_btn.clicked.connect(self.zoom_in)
-        self.zoom_reset_btn.clicked.connect(self.reset_zoom)
-        pattern_layout.addWidget(self.zoom_out_btn)
-        pattern_layout.addWidget(self.zoom_reset_btn)
-        pattern_layout.addWidget(self.zoom_in_btn)
-        right_layout.addWidget(pattern_bar)
+        top_layout.addWidget(QLabel("Tracks:"))
+        add_t_btn = QPushButton("+")
+        add_t_btn.setFixedWidth(28)
+        add_t_btn.clicked.connect(self.add_track)
+        top_layout.addWidget(add_t_btn)
 
-        self.piano_roll = PianoRoll(self)
-        self.piano_roll.note_changed.connect(self.on_notes_changed)
+        outer.addWidget(top_bar)
+
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        playlist_container = QWidget()
+        pc_layout = QVBoxLayout(playlist_container)
+        pc_layout.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel("PLAYLIST  (right-click empty = paint clip | right-click clip = delete | drag = move | drag edge = resize | double-click = edit pattern)")
+        lbl.setStyleSheet("color:#888; font-size:10px; padding:2px;")
+        pc_layout.addWidget(lbl)
+        self.playlist_scroll = QScrollArea()
+        self.playlist_scroll.setWidgetResizable(True)
+        self.playlist_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.playlist_view = PlaylistView(self)
+        self.playlist_view.pattern_double_clicked.connect(self.on_pattern_double_clicked)
+        self.playlist_scroll.setWidget(self.playlist_view)
+        pc_layout.addWidget(self.playlist_scroll)
+        main_splitter.addWidget(playlist_container)
+
+        piano_container = QWidget()
+        pr_layout = QVBoxLayout(piano_container)
+        pr_layout.setContentsMargins(0, 0, 0, 0)
+        pl = QLabel("PIANO ROLL  (editing current pattern)")
+        pl.setStyleSheet("color:#888; font-size:10px; padding:2px;")
+        pr_layout.addWidget(pl)
         self.piano_scroll = QScrollArea()
         self.piano_scroll.setWidgetResizable(True)
         self.piano_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.piano_roll = PianoRoll(self)
         self.piano_scroll.setWidget(self.piano_roll)
-        right_layout.addWidget(self.piano_scroll, 1)
-        QTimer.singleShot(0, self.apply_zoom)
+        pr_layout.addWidget(self.piano_scroll)
+        main_splitter.addWidget(piano_container)
 
-        footer = QLabel("Hybrid workflow: FL-style piano roll + BeepBox-style pattern editing.")
-        footer.setStyleSheet("color:#9A9A9A; padding:4px;")
-        right_layout.addWidget(footer)
+        main_splitter.setSizes([520, 340])
+        outer.addWidget(main_splitter, 1)
 
-        outer.addWidget(right, 1)
+        footer = QLabel("FL-Style Playlist DAW | Select a pattern, right-click on playlist to paint. Double-click clip to edit. | cmds: set bpm ___, show osc, show visualizer")
+        footer.setStyleSheet("color:#9A9A9A; padding:3px;")
+        outer.addWidget(footer)
 
         self.setStyleSheet(
             """
-            QMainWindow, QWidget {
-                background: #0A0A0A;
-                color: #E6E6E6;
-                font-family: Consolas, 'Courier New', monospace;
-                font-size: 12px;
-            }
-            QPushButton {
-                background: #1A1A1A;
-                border: 1px solid #444444;
-                padding: 8px;
-                border-radius: 6px;
-            }
+            QMainWindow, QWidget { background: #0A0A0A; color: #E6E6E6; font-family: Consolas, 'Courier New', monospace; font-size: 11px; }
+            QPushButton { background: #1A1A1A; border: 1px solid #444; padding: 5px; border-radius: 4px; }
             QPushButton:hover { background: #242424; }
-            QPushButton:checked { background: #D9D9D9; color: #080808; border: 1px solid #FFFFFF; }
-            QPushButton#transportCircle {
-                border-radius: 24px;
-                font-size: 28px;
-                font-weight: bold;
-                padding: 0px;
-            }
-            QPushButton#transportCircle:checked {
-                background: #E6E6E6;
-                color: #080808;
-                border: 2px solid #FFFFFF;
-            }
+            QPushButton:checked { background: #D9D9D9; color: #080808; border: 1px solid #FFF; }
+            QPushButton#transportCircle { border-radius: 20px; font-size: 22px; font-weight: bold; padding: 0; }
+            QPushButton#transportCircle:checked { background: #E6E6E6; color: #080808; border: 2px solid #FFF; }
             QScrollArea { border: 1px solid #4A4A4A; background: #050505; }
             QScrollBar:horizontal, QScrollBar:vertical { background: #0A0A0A; border: 1px solid #2A2A2A; }
-            QScrollBar::handle:horizontal, QScrollBar::handle:vertical { background: #777777; border: 1px solid #BDBDBD; }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget {
-                background: #141414;
-                border: 1px solid #3F3F3F;
-                padding: 5px;
-                border-radius: 4px;
-            }
+            QScrollBar::handle:horizontal, QScrollBar::handle:vertical { background: #777; border: 1px solid #BDBDBD; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #141414; border: 1px solid #3F3F3F; padding: 4px; border-radius: 3px; }
             QLabel { color: #E6E6E6; }
-            QListWidget::item { padding: 5px; }
+            QSplitter::handle { background: #333; }
             """
         )
 
-        # Make Space a transport-only hotkey instead of accidentally pressing focused buttons.
-        for button in self.findChildren(QPushButton):
-            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for btn in self.findChildren(QPushButton):
+            if btn.objectName() != "transportCircle":
+                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         QApplication.instance().installEventFilter(self)
+        QTimer.singleShot(0, self.apply_piano_zoom)
+        self.set_selected_pattern(0)
 
     def _bind_shortcuts(self) -> None:
-        zoom_in_action = QAction(self)
-        zoom_in_action.setShortcut("Ctrl++")
-        zoom_in_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        zoom_in_action.triggered.connect(self.zoom_in)
-        self.addAction(zoom_in_action)
+        for shortcut, slot in [
+            ("Ctrl++", lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 1.25)),
+            ("Ctrl+-", lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 0.8)),
+            ("Ctrl+S", self.save_project),
+            ("Ctrl+O", self.load_project),
+            ("Delete", self.piano_roll.delete_selected),
+        ]:
+            action = QAction(self)
+            action.setShortcut(shortcut)
+            action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            action.triggered.connect(slot)
+            self.addAction(action)
 
-        zoom_out_action = QAction(self)
-        zoom_out_action.setShortcut("Ctrl+-")
-        zoom_out_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        zoom_out_action.triggered.connect(self.zoom_out)
-        self.addAction(zoom_out_action)
+    def current_pattern(self) -> Pattern:
+        return self.patterns[self.selected_pattern_index]
 
-        save_action = QAction(self)
-        save_action.setShortcut("Ctrl+S")
-        save_action.triggered.connect(self.save_project)
-        self.addAction(save_action)
+    def set_selected_pattern(self, idx: int) -> None:
+        self.selected_pattern_index = idx
+        for i, btn in enumerate(self._pattern_buttons):
+            btn.blockSignals(True)
+            btn.setChecked(i == idx)
+            btn.blockSignals(False)
+        self.piano_roll.update()
 
-        load_action = QAction(self)
-        load_action.setShortcut("Ctrl+O")
-        load_action.triggered.connect(self.load_project)
-        self.addAction(load_action)
+    def set_playlist_zoom(self, zoom: float) -> None:
+        self.playlist_view.zoom_x = max(0.25, min(4.0, zoom))
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
 
-        delete_action = QAction(self)
-        delete_action.setShortcut("Delete")
-        delete_action.triggered.connect(self.piano_roll.delete_selected)
-        self.addAction(delete_action)
+    def apply_piano_zoom(self) -> None:
+        pat = self.current_pattern()
+        w = int(PianoRoll.KEYBOARD_W + pat.length_beats * 50 * self.piano_roll.zoom_x) + 50
+        h = int(PianoRoll.HEADER_H + (PianoRoll.MAX_MIDI - PianoRoll.MIN_MIDI + 1) * 14 * self.piano_roll.zoom_y) + 20
+        self.piano_roll.setMinimumWidth(max(600, w))
+        self.piano_roll.setMinimumHeight(max(300, h))
+        self.piano_roll.updateGeometry()
+        self.piano_roll.update()
 
-    # -------------------------- Data access --------------------------
+    def toggle_playback(self) -> None:
+        if self.playing:
+            self.stop_playback()
+            return
+        self.playing = True
+        self._last_playback_time = time.perf_counter()
+        self.update_transport()
+        self.playlist_view.update()
 
-    def current_track(self) -> Track:
-        return self.tracks[self.selected_track_index]
+    def stop_playback(self) -> None:
+        self.playing = False
+        self.playhead_song_beat = 0.0
+        self._last_playback_time = time.perf_counter()
+        self._release_all()
+        self.update_transport()
+        self.playlist_view.update()
 
-    def current_notes(self) -> List[Note]:
-        return self.current_track().patterns.setdefault(self.current_pattern, [])
+    def _release_all(self) -> None:
+        for key in list(self._last_active_keys):
+            self.synth.note_off(key)
+        self._last_active_keys.clear()
 
-    def ghost_notes_for_current_pattern(self) -> List[Tuple[Track, Note]]:
-        items: List[Tuple[Track, Note]] = []
-        for index, track in enumerate(self.tracks):
-            if index == self.selected_track_index:
-                continue
-            for note in track.patterns.get(self.current_pattern, []):
-                items.append((track, note))
-        return items
+    def update_playback(self) -> None:
+        now = time.perf_counter()
+        if not self.playing:
+            self._last_playback_time = now
+            return
+        delta = now - self._last_playback_time
+        self._last_playback_time = now
+        self.playhead_song_beat += delta * (self.bpm / 60.0)
 
-    def current_visible_local_beat(self) -> float:
-        if self.loop_mode == "Pattern":
-            return self.playhead_song_beat % self.pattern_length_beats
-        return self.playhead_song_beat % self.pattern_length_beats
+        active = self._collect_active_notes()
+        active_keys = set(active.keys())
 
-    # -------------------------- UI refresh --------------------------
+        for key in self._last_active_keys - active_keys:
+            self.synth.note_off(key)
+        for key in active_keys - self._last_active_keys:
+            pat, note = active[key]
+            self.synth.note_on(
+                key=key, pitch=note.pitch,
+                velocity=max(0.0, min(1.0, note.velocity / 127.0)),
+                waveform=pat.waveform, gain=pat.gain,
+            )
+
+        self._last_active_keys = active_keys
+        self.playlist_view.update()
+        self.piano_roll.update()
+
+    def _collect_active_notes(self) -> Dict[str, Tuple[Pattern, Note]]:
+        active: Dict[str, Tuple[Pattern, Note]] = {}
+        beat = self.playhead_song_beat
+
+        any_solo = any(t.solo for t in self.playlist_tracks)
+
+        for t_idx, track in enumerate(self.playlist_tracks):
+            if track.muted: continue
+            if any_solo and not track.solo: continue
+            for c_idx, clip in enumerate(track.clips):
+                if clip.muted: continue
+                if not (clip.start_beat <= beat < clip.start_beat + clip.duration_beats):
+                    continue
+                pat = self.patterns[clip.pattern_index]
+                local_beat = beat - clip.start_beat
+                for n_idx, note in enumerate(pat.notes):
+                    if note.muted: continue
+                    if note.start <= local_beat < note.start + note.duration:
+                        key = f"{t_idx}:{c_idx}:{n_idx}"
+                        active[key] = (pat, note)
+        return active
+
+    def add_track(self) -> None:
+        idx = len(self.playlist_tracks)
+        color = PATTERN_COLORS[idx % len(PATTERN_COLORS)]
+        self.playlist_tracks.append(PlaylistTrack(name=f"Track {idx+1}", color=color))
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+
+    def select_track(self, idx: int) -> None:
+        pass
+
+    def show_track_context_menu(self, track_idx: int, global_pos) -> None:
+        menu = QMenu(self)
+        track = self.playlist_tracks[track_idx]
+        mute_action = menu.addAction("Mute" if not track.muted else "Unmute")
+        mute_action.triggered.connect(lambda: self.toggle_track_mute(track_idx))
+        solo_action = menu.addAction("Solo" if not track.solo else "Unsolo")
+        solo_action.triggered.connect(lambda: self.toggle_track_solo(track_idx))
+        menu.addSeparator()
+        del_action = menu.addAction("Delete Track")
+        del_action.triggered.connect(lambda: self.delete_track(track_idx))
+        menu.exec(global_pos)
+
+    def toggle_track_mute(self, idx: int) -> None:
+        self.playlist_tracks[idx].muted = not self.playlist_tracks[idx].muted
+        self.playlist_view.update()
+
+    def toggle_track_solo(self, idx: int) -> None:
+        self.playlist_tracks[idx].solo = not self.playlist_tracks[idx].solo
+        self.playlist_view.update()
+
+    def delete_track(self, idx: int) -> None:
+        if len(self.playlist_tracks) <= 1: return
+        self.playlist_tracks.pop(idx)
+        for t_i, track in enumerate(self.playlist_tracks):
+            for clip in track.clips:
+                clip.track_index = t_i
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+
+    def on_pattern_double_clicked(self, pattern_index: int) -> None:
+        self.set_selected_pattern(pattern_index)
+
+    def on_bpm_changed(self, value: int) -> None:
+        self.bpm = value
+
+    def on_snap_changed(self, index: int) -> None:
+        self.current_snap = float(self.snap_combo.currentData())
+
+    def preview_note_on(self, key: str, pitch: int) -> None:
+        pat = self.current_pattern()
+        self._preview_keys.add(key)
+        self.synth.note_on(key, pitch, velocity=0.9, waveform=pat.waveform, gain=min(1.0, pat.gain))
+
+    def preview_note_off(self, key: str) -> None:
+        if key in self._preview_keys:
+            self.synth.note_off(key)
+            self._preview_keys.discard(key)
+
+    def update_transport(self) -> None:
+        if hasattr(self, "play_btn"):
+            self.play_btn.blockSignals(True)
+            self.play_btn.setChecked(self.playing)
+            self.play_btn.setText("●" if self.playing else "○")
+            self.play_btn.blockSignals(False)
+
+    def project_data(self) -> dict:
+        return {
+            "app": "Nill FL Playlist", "version": 5,
+            "bpm": self.bpm, "snap": self.current_snap,
+            "patterns": [p.to_dict() for p in self.patterns],
+            "tracks": [t.to_dict() for t in self.playlist_tracks],
+        }
+
+    def save_project(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Nill Project",
+            str(Path.home() / "nill_playlist.json"), "Nill Project (*.json)",
+        )
+        if not path: return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self.project_data(), fh, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
+
+    def load_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Nill Project", str(Path.home()), "Nill Project (*.json)",
+        )
+        if not path: return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Failed", str(exc))
+            return
+        self.stop_playback()
+        self.bpm = int(data.get("bpm", 140))
+        self.patterns = [Pattern.from_dict(p) for p in data.get("patterns", [])]
+        self.playlist_tracks = [PlaylistTrack.from_dict(t) for t in data.get("tracks", [])]
+        self.selected_pattern_index = 0
+        self.bpm_spin.setValue(self.bpm)
+        self.refresh_pattern_buttons()
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+        self.piano_roll.update()
 
     def refresh_pattern_buttons(self) -> None:
         for i, btn in enumerate(self._pattern_buttons):
             btn.blockSignals(True)
-            btn.setChecked(i == self.current_pattern)
+            btn.setChecked(i == self.selected_pattern_index)
             btn.blockSignals(False)
 
-    def refresh_track_list(self) -> None:
-        self.track_list.blockSignals(True)
-        self.track_list.clear()
-        for track in self.tracks:
-            item = QListWidgetItem(f"{track.name}  [{track.waveform}]")
-            item.setBackground(QColor(track.color))
-            item.setForeground(QColor("#090909"))
-            self.track_list.addItem(item)
-        self.track_list.setCurrentRow(self.selected_track_index)
-        self.track_list.blockSignals(False)
-
-    def refresh_track_controls(self) -> None:
-        if not self.tracks:
-            return
-        track = self.current_track()
-        self.track_name_edit.blockSignals(True)
-        self.track_wave_combo.blockSignals(True)
-        self.track_gain_spin.blockSignals(True)
-        self.track_name_edit.setText(track.name)
-        self.track_wave_combo.setCurrentText(track.waveform)
-        self.track_gain_spin.setValue(track.gain)
-        self.track_name_edit.blockSignals(False)
-        self.track_wave_combo.blockSignals(False)
-        self.track_gain_spin.blockSignals(False)
-        self.piano_roll.update()
-
+    # ============================ COMMANDS ============================
 
     def run_command_line(self) -> None:
         raw = self.command_line.text().strip()
         command = " ".join(raw.lower().split())
-
         if not command:
             return
-
         if command.startswith("set bpm "):
             value_text = command.removeprefix("set bpm ").strip()
             try:
@@ -1111,384 +1295,36 @@ class Nill(QMainWindow):
             self.bpm_spin.setValue(bpm)
             self.command_line.clear()
             return
-
         if command == "show osc":
             self.command_line.clear()
             self.show_osc()
             return
-
         if command == "show visualizer":
             self.command_line.clear()
             self.show_visualizer()
             return
-
         QMessageBox.warning(self, "Command", "Allowed commands:\nset bpm ___\nshow osc\nshow visualizer")
 
     def show_osc(self) -> None:
-        """Launch Nill OSC from this Nill file."""
         if self.osc_process is not None and self.osc_process.poll() is None:
             QMessageBox.information(self, "OSC", "OSC window is already running.")
             return
-
         try:
             self.osc_process = subprocess.Popen([sys.executable, str(Path(__file__)), "--nill-osc"])
         except Exception as exc:
             QMessageBox.critical(self, "OSC Failed", str(exc))
 
     def show_visualizer(self) -> None:
-        """Launch the embedded pygame audio visualizer from this Nill file."""
         if self.visualizer_process is not None and self.visualizer_process.poll() is None:
             QMessageBox.information(self, "Visualizer", "Visualizer is already running.")
             return
-
         try:
             self.visualizer_process = subprocess.Popen([sys.executable, str(Path(__file__)), "--nill-visualizer"])
         except Exception as exc:
             QMessageBox.critical(self, "Visualizer Failed", str(exc))
 
-    def update_transport_button(self) -> None:
-        if not hasattr(self, "play_btn"):
-            return
-        self.play_btn.blockSignals(True)
-        self.play_btn.setChecked(self.playing)
-        self.play_btn.setText("●" if self.playing else "○")
-        self.play_btn.setToolTip("Stop sequence (Space)" if self.playing else "Play sequence (Space)")
-        self.play_btn.blockSignals(False)
-
-    def apply_zoom(self) -> None:
-        """Apply FL-style piano-roll zoom without scaling the surrounding UI."""
-        if not hasattr(self, "piano_roll"):
-            return
-
-        viewport_width = self.piano_roll.width()
-        viewport_height = self.piano_roll.height()
-        if hasattr(self, "piano_scroll"):
-            viewport_width = max(1, self.piano_scroll.viewport().width())
-            viewport_height = max(1, self.piano_scroll.viewport().height())
-
-        base_beat = max(12.0, max(100.0, float(viewport_width - PianoRoll.KEYBOARD_W)) / float(max(1, self.pattern_length_beats)))
-        base_row = max(10.0, max(200.0, float(viewport_height - PianoRoll.HEADER_H - PianoRoll.FOOTER_H)) / float(PianoRoll.MAX_MIDI - PianoRoll.MIN_MIDI + 1))
-
-        zoomed_width = int(PianoRoll.KEYBOARD_W + self.pattern_length_beats * base_beat * self.zoom_x) + 4
-        zoomed_height = int(PianoRoll.HEADER_H + (PianoRoll.MAX_MIDI - PianoRoll.MIN_MIDI + 1) * base_row * self.zoom_y) + 4
-
-        # Only the piano-roll canvas changes. The sidebar, buttons, pattern bar,
-        # and other UI widgets stay the same size. Bigger zoom = bigger note blocks.
-        self.piano_roll.setMinimumWidth(max(800, zoomed_width))
-        self.piano_roll.setMinimumHeight(max(500, zoomed_height))
-
-        if hasattr(self, "zoom_reset_btn"):
-            self.zoom_reset_btn.setText(f"{int(self.zoom_x * 100)}%")
-        self.piano_roll.updateGeometry()
-        self.piano_roll.update()
-
-    def zoom_in(self) -> None:
-        self.zoom_x = min(4.0, round(self.zoom_x + 0.25, 2))
-        self.zoom_y = min(3.0, round(self.zoom_y + 0.20, 2))
-        self.apply_zoom()
-
-    def zoom_out(self) -> None:
-        self.zoom_x = max(1.0, round(self.zoom_x - 0.25, 2))
-        self.zoom_y = max(1.0, round(self.zoom_y - 0.20, 2))
-        self.apply_zoom()
-
-    def reset_zoom(self) -> None:
-        self.zoom_x = 1.0
-        self.zoom_y = 1.0
-        self.apply_zoom()
-
-    # -------------------------- Controls --------------------------
-
-    def on_bpm_changed(self, value: int) -> None:
-        self.bpm = value
-
-    def on_loop_mode_changed(self, text: str) -> None:
-        self.loop_mode = text
-        self.stop_playback()
-
-    def on_pattern_length_changed(self, value: int) -> None:
-        self.pattern_length_beats = value
-        self.apply_zoom()
-
-    def on_snap_changed(self, index: int) -> None:
-        self.current_snap = float(self.snap_combo.currentData())
-        self.piano_roll.update()
-
-    def set_grid_snap(self, value: float) -> None:
-        self.current_snap = value
-        snap_index = self.snap_combo.findData(value)
-        if snap_index >= 0:
-            self.snap_combo.blockSignals(True)
-            self.snap_combo.setCurrentIndex(snap_index)
-            self.snap_combo.blockSignals(False)
-        self.piano_roll.update()
-
-    def show_grid_menu(self, global_pos) -> None:
-        menu = QMenu(self)
-        menu.setTitle("Grid Size")
-        grid_options = [("1/2", 0.5), ("1/4", 0.25), ("1/8", 0.125), ("1/16", 0.0625), ("1/32", 0.03125)]
-        for label, value in grid_options:
-            action = menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(abs(self.current_snap - value) < 0.000001)
-            action.triggered.connect(lambda checked=False, snap=value: self.set_grid_snap(snap))
-        menu.exec(global_pos)
-
-    def on_note_length_changed(self, index: int) -> None:
-        self.default_note_length = float(self.note_len_combo.currentData())
-
-    def on_scale_changed(self, *args) -> None:
-        self.scale_root = self.scale_root_combo.currentText()
-        self.scale_mode = self.scale_mode_combo.currentText()
-        self.piano_roll.update()
-
-    def on_stamp_changed(self, text: str) -> None:
-        self.stamp_mode = text
-
-    def on_ghosts_toggled(self, checked: bool) -> None:
-        self.show_ghosts = checked
-        self.piano_roll.update()
-
-    def on_track_selected(self, row: int) -> None:
-        if row < 0 or row >= len(self.tracks):
-            return
-        self.selected_track_index = row
-        self.refresh_track_controls()
-        self.piano_roll.selected_note = None
-        self.piano_roll.update()
-
-    def on_track_name_edited(self) -> None:
-        self.current_track().name = self.track_name_edit.text().strip() or "Track"
-        self.refresh_track_list()
-        self.piano_roll.update()
-
-    def on_track_wave_changed(self, text: str) -> None:
-        self.current_track().waveform = text
-        self.refresh_track_list()
-
-    def on_track_gain_changed(self, value: float) -> None:
-        self.current_track().gain = value
-
-    def on_notes_changed(self) -> None:
-        self.piano_roll.update()
-
-    def set_current_pattern(self, index: int) -> None:
-        self.current_pattern = index
-        self.refresh_pattern_buttons()
-        self.piano_roll.selected_note = None
-        self.piano_roll.update()
-
-    def add_track(self) -> None:
-        color = DEFAULT_TRACK_COLORS[len(self.tracks) % len(DEFAULT_TRACK_COLORS)]
-        name = f"Track {len(self.tracks) + 1}"
-        waveform_cycle = ["square", "triangle", "saw", "noise"]
-        waveform = waveform_cycle[len(self.tracks) % len(waveform_cycle)]
-        self.tracks.append(Track(name=name, color=color, waveform=waveform, gain=0.70))
-        self.selected_track_index = len(self.tracks) - 1
-        self.refresh_track_list()
-        self.refresh_track_controls()
-
-    def remove_track(self) -> None:
-        if len(self.tracks) <= 1:
-            QMessageBox.information(self, "Nill", "At least one track must remain.")
-            return
-        self.tracks.pop(self.selected_track_index)
-        self.selected_track_index = max(0, min(self.selected_track_index, len(self.tracks) - 1))
-        self.refresh_track_list()
-        self.refresh_track_controls()
-        self.piano_roll.update()
-
-    # -------------------------- Playback --------------------------
-
-    def toggle_playback(self) -> None:
-        # Single transport control: Space / circle button starts from the current position,
-        # and stops the sequence by resetting the playhead to the beginning.
-        if self.playing:
-            self.stop_playback()
-            return
-        self.playing = True
-        self._last_playback_time = time.perf_counter()
-        self.update_transport_button()
-        self.piano_roll.update()
-
-    def stop_playback(self) -> None:
-        self.playing = False
-        self.playhead_song_beat = 0.0
-        self._last_playback_time = time.perf_counter()
-        self._release_all_active_playback_notes()
-        self.update_transport_button()
-        self.piano_roll.update()
-
-    def _release_all_active_playback_notes(self) -> None:
-        for key in list(self._last_active_keys):
-            self.synth.note_off(key)
-        self._last_active_keys.clear()
-
-    def _collect_active_notes(self) -> Dict[str, Tuple[Track, Note]]:
-        active: Dict[str, Tuple[Track, Note]] = {}
-
-        if self.loop_mode == "Pattern":
-            pattern_index = self.current_pattern
-            local_beat = self.playhead_song_beat % self.pattern_length_beats
-        else:
-            total_beats = self.pattern_count * self.pattern_length_beats
-            if total_beats <= 0:
-                return active
-            song_beat = self.playhead_song_beat % total_beats
-            slot = int(song_beat // self.pattern_length_beats)
-            pattern_index = self.song_order[slot]
-            local_beat = song_beat - slot * self.pattern_length_beats
-
-        for track_index, track in enumerate(self.tracks):
-            pattern_notes = track.patterns.get(pattern_index, [])
-            for note_index, note in enumerate(pattern_notes):
-                if note.muted:
-                    continue
-                if note.start <= local_beat < (note.start + note.duration):
-                    key = f"{track_index}:{pattern_index}:{note_index}"
-                    active[key] = (track, note)
-        return active
-
-    def update_playback(self) -> None:
-        now = time.perf_counter()
-        if not self.playing:
-            self._last_playback_time = now
-            return
-
-        delta = now - self._last_playback_time
-        self._last_playback_time = now
-        self.playhead_song_beat += delta * (self.bpm / 60.0)
-
-        if self.loop_mode == "Pattern":
-            total_beats = self.pattern_length_beats
-        else:
-            total_beats = self.pattern_length_beats * self.pattern_count
-
-        if total_beats > 0 and self.playhead_song_beat >= total_beats:
-            self.playhead_song_beat %= total_beats
-
-        active = self._collect_active_notes()
-        active_keys = set(active.keys())
-
-        for key in self._last_active_keys - active_keys:
-            self.synth.note_off(key)
-
-        for key in active_keys - self._last_active_keys:
-            track, note = active[key]
-            self.synth.note_on(
-                key=key,
-                pitch=note.pitch,
-                velocity=max(0.0, min(1.0, note.velocity / 127.0)),
-                waveform=track.waveform,
-                gain=track.gain,
-            )
-
-        self._last_active_keys = active_keys
-        self.piano_roll.update()
-
-    # -------------------------- Preview --------------------------
-
-    def preview_note_on(self, key: str, pitch: int) -> None:
-        track = self.current_track()
-        self._preview_keys.add(key)
-        self.synth.note_on(key, pitch, velocity=0.9, waveform=track.waveform, gain=min(1.0, track.gain))
-
-    def preview_note_off(self, key: str) -> None:
-        if key in self._preview_keys:
-            self.synth.note_off(key)
-            self._preview_keys.discard(key)
-
-    # -------------------------- Save / Load --------------------------
-
-    def project_data(self) -> dict:
-        return {
-            "app": "Nill Terminal Monochrome",
-            "version": 2,
-            "bpm": self.bpm,
-            "pattern_count": self.pattern_count,
-            "current_pattern": self.current_pattern,
-            "pattern_length_beats": self.pattern_length_beats,
-            "scale_root": self.scale_root,
-            "scale_mode": self.scale_mode,
-            "snap": self.current_snap,
-            "draw_length": self.default_note_length,
-            "stamp_mode": self.stamp_mode,
-            "show_ghosts": self.show_ghosts,
-            "tracks": [track.to_dict() for track in self.tracks],
-        }
-
-    def save_project(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Nill Project",
-            str(Path.home() / "nill_project.json"),
-            "Nill Project (*.json)",
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(self.project_data(), fh, indent=2)
-        except Exception as exc:
-            QMessageBox.critical(self, "Save Failed", str(exc))
-
-    def load_project(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Load Nill Project",
-            str(Path.home()),
-            "Nill Project (*.json)",
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception as exc:
-            QMessageBox.critical(self, "Load Failed", str(exc))
-            return
-
-        self.stop_playback()
-        self.bpm = int(data.get("bpm", 140))
-        self.pattern_count = min(len(self._pattern_buttons), int(data.get("pattern_count", 8)))
-        self.current_pattern = int(data.get("current_pattern", 0))
-        self.pattern_length_beats = int(data.get("pattern_length_beats", 8))
-        self.scale_root = str(data.get("scale_root", "C"))
-        self.scale_mode = str(data.get("scale_mode", "Minor"))
-        self.current_snap = float(data.get("snap", 0.25))
-        self.default_note_length = float(data.get("draw_length", 1.0))
-        self.stamp_mode = str(data.get("stamp_mode", "Single"))
-        self.show_ghosts = bool(data.get("show_ghosts", True))
-        self.song_order = list(range(self.pattern_count))
-
-        loaded_tracks = [Track.from_dict(t) for t in data.get("tracks", [])]
-        self.tracks = loaded_tracks if loaded_tracks else [Track(name="Track 1", color="#E6E6E6")]
-        self.selected_track_index = 0
-
-        self.bpm_spin.setValue(self.bpm)
-        self.pattern_len_spin.setValue(self.pattern_length_beats)
-        self.scale_root_combo.setCurrentText(self.scale_root)
-        self.scale_mode_combo.setCurrentText(self.scale_mode)
-        self.ghosts_check.setChecked(self.show_ghosts)
-        self.stamp_combo.setCurrentText(self.stamp_mode)
-
-        snap_index = max(0, self.snap_combo.findData(self.current_snap))
-        self.snap_combo.setCurrentIndex(snap_index)
-        note_len_index = max(0, self.note_len_combo.findData(self.default_note_length))
-        self.note_len_combo.setCurrentIndex(note_len_index)
-
-        self.current_pattern = max(0, min(self.current_pattern, self.pattern_count - 1))
-        self.refresh_track_list()
-        self.refresh_track_controls()
-        self.refresh_pattern_buttons()
-        self.piano_roll.selected_note = None
-        self.piano_roll.update()
-
-    # -------------------------- Events --------------------------
-
     def eventFilter(self, watched, event) -> bool:
         if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
-            # Let the command line type spaces for commands like "set bpm 140".
             if hasattr(self, "command_line") and self.command_line.hasFocus():
                 return False
             self.toggle_playback()
@@ -1500,83 +1336,823 @@ class Nill(QMainWindow):
             self.piano_roll.delete_selected()
             event.accept()
             return
-
         note = self.piano_roll.selected_note
-        if note is not None:
+        if note:
             if event.key() == Qt.Key.Key_Up:
                 note.pitch = min(PianoRoll.MAX_MIDI, note.pitch + 1)
-                self.piano_roll.update()
-                return
+                self.piano_roll.update(); return
             if event.key() == Qt.Key.Key_Down:
                 note.pitch = max(PianoRoll.MIN_MIDI, note.pitch - 1)
-                self.piano_roll.update()
-                return
+                self.piano_roll.update(); return
             if event.key() == Qt.Key.Key_Left:
                 note.start = max(0.0, note.start - self.current_snap)
-                self.piano_roll.update()
-                return
+                self.piano_roll.update(); return
             if event.key() == Qt.Key.Key_Right:
-                note.start = min(self.pattern_length_beats - note.duration, note.start + self.current_snap)
-                self.piano_roll.update()
-                return
+                note.start = min(self.current_pattern().length_beats - note.duration, note.start + self.current_snap)
+                self.piano_roll.update(); return
         super().keyPressEvent(event)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        if hasattr(self, "piano_roll"):
-            QTimer.singleShot(0, self.apply_zoom)
 
     def closeEvent(self, event) -> None:
         self.stop_playback()
         self.synth.all_notes_off()
-        if self.visualizer_process is not None and self.visualizer_process.poll() is None:
-            try:
-                self.visualizer_process.terminate()
-            except Exception:
-                pass
-        if self.osc_process is not None and self.osc_process.poll() is None:
-            try:
-                self.osc_process.terminate()
-            except Exception:
-                pass
-        if self.stream is not None:
+        for proc in [self.visualizer_process, self.osc_process]:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        if self.stream:
             try:
                 self.stream.stop()
                 self.stream.close()
-            except Exception:
-                pass
+            except Exception: pass
         super().closeEvent(event)
 
 
+# ============================ EMBEDDED OSC ============================
+
+EMBEDDED_OSC_CODE = r'''
+import tkinter as tk
+from tkinter import Canvas
+import math
+import numpy as np
+from typing import Dict, List, Optional
+import threading
+import time
+import sounddevice as sd
+
+BG_BLACK = '#000000'
+BG_DARK = '#111111'
+BG_PANEL = '#0a0a0a'
+FG_WHITE = '#FFFFFF'
+FG_DIM = '#666666'
+FG_BRIGHT = '#CCCCCC'
+BORDER = '#333333'
+KNOB_BODY = '#505050'
+KNOB_SURFACE = '#1a1a1a'
+FONT_MAIN = 'Consolas'
+
+SR = 44100
+BUFFER_SIZE = 2048
+AMP = 0.08
+
+WAVEFORMS = ['sine', 'triangle', 'saw', 'square']
+WHITE_KEYS = {'a': 60, 's': 62, 'd': 64, 'f': 65, 'g': 67, 'h': 69, 'j': 71, 'k': 72, 'l': 74, ';': 76, "'": 77}
+BLACK_KEYS = {'w': 61, 'e': 63, 't': 66, 'y': 68, 'u': 70, 'o': 73, 'p': 75}
+ALL_KEYS = {**WHITE_KEYS, **BLACK_KEYS}
+OCTAVE_LABELS = {60: 'C3', 72: 'C4', 84: 'C5'}
+
+class PolyphonicSynth:
+    def __init__(self) -> None:
+        self.active_notes: Dict[int, Dict] = {}
+        self.sample_rate = SR
+        self.buffer_size = BUFFER_SIZE
+        self._lock = threading.Lock()
+        self.last_buffer = np.zeros(BUFFER_SIZE, dtype=np.float32)
+        self.waveform_type = 'sine'
+        self.use_global_waveform = False
+        self.osc1_wave = 'sine'
+        self.osc1_detune = 0.0
+        self.osc1_level = 1.0
+        self.osc1_phase = 0.0
+        self.osc2_wave = 'saw'
+        self.osc2_detune = 0.0
+        self.osc2_level = 0.0
+        self.osc2_phase = 0.0
+        self.fx_distortion = 0.0
+        self.fx_delay_time = 0.3
+        self.fx_delay_feedback = 0.4
+        self.fx_delay_mix = 0.0
+        self.fx_reverb_mix = 0.0
+        self.delay_buffer_size = int(SR * 2.0)
+        self.delay_buffer = np.zeros(self.delay_buffer_size, dtype=np.float32)
+        self.delay_write_idx = 0
+        self.attack_time = 0.01
+        self.decay_time = 0.1
+        self.sustain_level = 0.8
+        self.release_time = 0.3
+
+    def set_waveform(self, waveform: str) -> None:
+        with self._lock:
+            self.waveform_type = waveform
+
+    def set_osc_wave(self, osc: int, wave: str) -> None:
+        with self._lock:
+            if osc == 1: self.osc1_wave = wave
+            elif osc == 2: self.osc2_wave = wave
+
+    def set_osc_detune(self, osc: int, value: float) -> None:
+        with self._lock:
+            if osc == 1: self.osc1_detune = value
+            elif osc == 2: self.osc2_detune = value
+
+    def set_osc_level(self, osc: int, value: float) -> None:
+        with self._lock:
+            if osc == 1: self.osc1_level = value
+            elif osc == 2: self.osc2_level = value
+
+    def set_osc_phase(self, osc: int, value: float) -> None:
+        with self._lock:
+            if osc == 1: self.osc1_phase = value
+            elif osc == 2: self.osc2_phase = value
+
+    def note_on(self, midi_note: int) -> None:
+        with self._lock:
+            freq = 440 * (2 ** ((midi_note - 69) / 12))
+            self.active_notes[midi_note] = {
+                'freq': freq, 'phase1': self.osc1_phase * np.pi * 2,
+                'phase2': self.osc2_phase * np.pi * 2, 'vel': 0.8,
+                'start_time': time.time(), 'envelope_stage': 'attack',
+                'envelope_value': 0.0, 'release_start': None
+            }
+
+    def note_off(self, midi_note: int) -> None:
+        with self._lock:
+            if midi_note in self.active_notes:
+                note = self.active_notes[midi_note]
+                if note['envelope_stage'] != 'release':
+                    note['envelope_stage'] = 'release'
+                    note['release_start'] = time.time()
+
+    def _get_envelope_value(self, note: Dict, current_time: float) -> float:
+        elapsed = current_time - note['start_time']
+        if note['envelope_stage'] == 'attack':
+            if elapsed < self.attack_time: return elapsed / self.attack_time
+            else: note['envelope_stage'] = 'decay'; elapsed -= self.attack_time
+        if note['envelope_stage'] == 'decay':
+            if elapsed < self.decay_time:
+                decay_amount = 1.0 - self.sustain_level
+                return 1.0 - decay_amount * (elapsed / self.decay_time)
+            else: note['envelope_stage'] = 'sustain'; return self.sustain_level
+        if note['envelope_stage'] == 'sustain': return self.sustain_level
+        if note['envelope_stage'] == 'release':
+            if note['release_start'] is None: return 0.0
+            release_elapsed = current_time - note['release_start']
+            if release_elapsed >= self.release_time: return 0.0
+            sustain_value = note.get('envelope_value', self.sustain_level)
+            return sustain_value * (1.0 - release_elapsed / self.release_time)
+        return 0.0
+
+    def set_effect_param(self, name: str, value: float) -> None:
+        with self._lock:
+            if name == 'distortion': self.fx_distortion = value
+            elif name == 'delay_time': self.fx_delay_time = value
+            elif name == 'delay_feedback': self.fx_delay_feedback = value
+            elif name == 'delay_mix': self.fx_delay_mix = value
+            elif name == 'reverb_mix': self.fx_reverb_mix = value
+
+    def _apply_effects(self, buffer: np.ndarray) -> np.ndarray:
+        if self.fx_distortion > 0.01:
+            drive = 1.0 + (self.fx_distortion * 10.0)
+            buffer = np.tanh(buffer * drive)
+        if self.fx_delay_mix > 0.01 or self.fx_reverb_mix > 0.01:
+            delay_samples = int(self.fx_delay_time * self.sample_rate)
+            delay_samples = max(1, min(delay_samples, self.delay_buffer_size - 1))
+            wet_mix = max(self.fx_delay_mix, self.fx_reverb_mix)
+            feedback = self.fx_delay_feedback
+            if self.fx_reverb_mix > 0.5: feedback = 0.7 + (self.fx_reverb_mix * 0.25)
+            output = np.zeros_like(buffer)
+            for i in range(len(buffer)):
+                read_idx = int(self.delay_write_idx - delay_samples)
+                if read_idx < 0: read_idx += self.delay_buffer_size
+                delayed_sample = self.delay_buffer[read_idx]
+                self.delay_buffer[self.delay_write_idx] = buffer[i] + (delayed_sample * feedback)
+                output[i] = (buffer[i] * (1.0 - wet_mix)) + (delayed_sample * wet_mix)
+                self.delay_write_idx += 1
+                if self.delay_write_idx >= self.delay_buffer_size: self.delay_write_idx = 0
+            buffer = output
+        return buffer
+
+    def _generate_wave(self, phases: np.ndarray, wave_type: str, detune_cents: float) -> np.ndarray:
+        if detune_cents != 0.0:
+            detune_ratio = 2 ** (detune_cents / 1200.0)
+            phases = (phases * detune_ratio) % 1.0
+        if wave_type == 'sine': return np.sin(2 * np.pi * phases)
+        elif wave_type == 'square': return np.where(phases < 0.5, 1.0, -1.0)
+        elif wave_type == 'saw': return 2 * (phases - 0.5)
+        elif wave_type == 'triangle': return 2 * np.abs(2 * (phases - 0.5)) - 1
+        return np.sin(2 * np.pi * phases)
+
+    def generate_audio(self, num_samples: int) -> np.ndarray:
+        buffer = np.zeros(num_samples, dtype=np.float32)
+        current_time = time.time()
+        with self._lock:
+            active_count = len(self.active_notes)
+            if active_count == 0:
+                buffer = self._apply_effects(buffer)
+                self.last_buffer = buffer
+                return buffer
+            notes_to_remove = []
+            for midi_note, note_data in list(self.active_notes.items()):
+                envelope = self._get_envelope_value(note_data, current_time)
+                note_data['envelope_value'] = envelope
+                if envelope <= 0.001:
+                    notes_to_remove.append(midi_note)
+                    continue
+                freq = note_data['freq']
+                phase1 = note_data['phase1']
+                phase2 = note_data['phase2']
+                vel = note_data['vel']
+                t = np.arange(num_samples)
+                phases1 = (phase1 / (np.pi * 2) + (freq / self.sample_rate) * t) % 1.0
+                phases2 = (phase2 / (np.pi * 2) + (freq / self.sample_rate) * t) % 1.0
+                wave1 = self.waveform_type if self.use_global_waveform else self.osc1_wave
+                wave2 = self.waveform_type if self.use_global_waveform else self.osc2_wave
+                osc1 = self._generate_wave(phases1, wave1, self.osc1_detune)
+                osc2 = self._generate_wave(phases2, wave2, self.osc2_detune)
+                mix = (osc1 * self.osc1_level) + (osc2 * self.osc2_level)
+                buffer += mix * vel * envelope
+                note_data['phase1'] = phases1[-1] * 2 * np.pi
+                note_data['phase2'] = phases2[-1] * 2 * np.pi
+            for midi_note in notes_to_remove:
+                del self.active_notes[midi_note]
+            if active_count > 1:
+                max_val = np.max(np.abs(buffer))
+                if max_val > 0: buffer = buffer / max_val * 0.9
+            buffer *= AMP
+        buffer = self._apply_effects(buffer)
+        buffer = np.clip(buffer, -1.0, 1.0)
+        self.last_buffer = buffer
+        return buffer
+
+class RotaryKnob(Canvas):
+    def __init__(self, parent, value=0.0, min_val=0.0, max_val=1.0,
+                 label="", format_fn=None, on_change=None, size=52, **kw):
+        super().__init__(parent, width=size + 40, height=size + 60,
+                        bg=BG_BLACK, highlightthickness=0, **kw)
+        self.value = value
+        self.default_value = value
+        self.min_val = min_val
+        self.max_val = max_val
+        self.label = label
+        self.format_fn = format_fn or (lambda v: f'{v:.0f}')
+        self.on_change = on_change
+        self.size = size
+        self.radius = size / 2
+        self.center_x = self.radius + 20
+        self.center_y = self.radius + 30
+        self.min_angle = -135
+        self.max_angle = 135
+        self.is_dragging = False
+        self.drag_start_y = 0
+        self.drag_start_value = 0
+        self.bind('<Button-1>', self._on_mouse_down)
+        self.bind('<B1-Motion>', self._on_mouse_drag)
+        self.bind('<ButtonRelease-1>', self._on_mouse_up)
+        self.bind('<Double-Button-1>', self._on_double_click)
+        self.bind('<MouseWheel>', self._on_mouse_wheel)
+        self.bind('<Button-4>', self._on_mouse_wheel)
+        self.bind('<Button-5>', self._on_mouse_wheel)
+        self.draw()
+
+    def _get_angle(self):
+        if self.max_val == self.min_val: return self.min_angle
+        normalized = (self.value - self.min_val) / (self.max_val - self.min_val)
+        return self.min_angle + normalized * (self.max_angle - self.min_angle)
+
+    def set_value(self, value):
+        old_value = self.value
+        self.value = max(self.min_val, min(self.max_val, value))
+        if abs(self.value - old_value) > 0.001:
+            self.draw()
+            if self.on_change: self.on_change(self.value)
+
+    def reset_to_default(self):
+        if abs(self.value - self.default_value) > 0.001:
+            self.set_value(self.default_value)
+
+    def _on_mouse_down(self, event):
+        dx = event.x - self.center_x
+        dy = event.y - self.center_y
+        distance = math.sqrt(dx**2 + dy**2)
+        if distance < self.radius * 0.8:
+            self.is_dragging = True
+            self.drag_start_y = event.y_root
+            self.drag_start_value = self.value
+            self.config(cursor='fleur')
+
+    def _on_mouse_drag(self, event):
+        if not self.is_dragging: return
+        delta_y = self.drag_start_y - event.y_root
+        sensitivity = (self.max_val - self.min_val) / 200
+        self.set_value(self.drag_start_value + delta_y * sensitivity)
+
+    def _on_mouse_up(self, event):
+        self.is_dragging = False
+        self.config(cursor='hand2')
+
+    def _on_double_click(self, event):
+        dx = event.x - self.center_x
+        dy = event.y - self.center_y
+        distance = math.sqrt(dx**2 + dy**2)
+        if distance < self.radius * 0.8:
+            self.reset_to_default()
+
+    def _on_mouse_wheel(self, event):
+        delta = 0.02 if (event.num == 4 or event.delta > 0) else -0.02
+        self.set_value(self.value + delta * (self.max_val - self.min_val))
+        return 'break'
+
+    def draw(self):
+        self.delete('all')
+        angle = self._get_angle()
+        angle_rad = math.radians(angle)
+        self.create_oval(self.center_x - self.radius, self.center_y - self.radius,
+                        self.center_x + self.radius, self.center_y + self.radius,
+                        fill=KNOB_BODY, outline=BORDER, width=1)
+        inner_r = self.radius * 0.75
+        self.create_oval(self.center_x - inner_r, self.center_y - inner_r,
+                        self.center_x + inner_r, self.center_y + inner_r,
+                        fill=KNOB_SURFACE, outline=BORDER, width=1)
+        arc_radius = self.radius * 0.90
+        if self.value > self.min_val:
+            self.create_arc(self.center_x - arc_radius, self.center_y - arc_radius,
+                          self.center_x + arc_radius, self.center_y + arc_radius,
+                          start=self.min_angle, extent=angle - self.min_angle,
+                          style='arc', outline=FG_BRIGHT, width=3)
+        line_start_r = self.radius * 0.2
+        line_end_r = self.radius * 0.6
+        start_x = self.center_x + line_start_r * math.cos(angle_rad - math.pi/2)
+        start_y = self.center_y + line_start_r * math.sin(angle_rad - math.pi/2)
+        end_x = self.center_x + line_end_r * math.cos(angle_rad - math.pi/2)
+        end_y = self.center_y + line_end_r * math.sin(angle_rad - math.pi/2)
+        self.create_line(start_x, start_y, end_x, end_y, fill=FG_BRIGHT, width=2)
+        self.create_oval(self.center_x - self.radius * 0.15, self.center_y - self.radius * 0.15,
+                        self.center_x + self.radius * 0.15, self.center_y + self.radius * 0.15,
+                        fill=BORDER, outline=KNOB_SURFACE, width=1)
+        self.create_text(self.center_x, self.center_y + self.radius + 25,
+                        text=self.label.upper(), font=(FONT_MAIN, 7, 'bold'), fill=FG_DIM)
+        self.create_text(self.center_x, 12, text=self.format_fn(self.value),
+                        font=(FONT_MAIN, 9, 'bold'), fill=FG_WHITE)
+
+class PianoKeyboard(Canvas):
+    def __init__(self, parent, start_note=60, num_octaves=2, **kw):
+        super().__init__(parent, bg=BG_BLACK, highlightthickness=0, **kw)
+        self.start_note = start_note
+        self.num_octaves = num_octaves
+        self.white_key_width = 40
+        self.black_key_width = 24
+        self.white_key_height = 120
+        self.black_key_height = 75
+        self.active_keys = set()
+        self.key_rects = {}
+        self._draw_keyboard()
+
+    def _draw_keyboard(self):
+        self.delete('all')
+        self.key_rects = {}
+        x = 10
+        white_notes = [0, 2, 4, 5, 7, 9, 11]
+        for octave in range(self.num_octaves):
+            for offset in white_notes:
+                midi_note = self.start_note + (octave * 12) + offset
+                key_letter = None
+                for k, v in WHITE_KEYS.items():
+                    if v == midi_note:
+                        key_letter = k.upper()
+                        break
+                rect = self.create_rectangle(x, 0, x + self.white_key_width, self.white_key_height,
+                                           fill=BG_DARK, outline=BORDER, width=1)
+                self.key_rects[midi_note] = rect
+                if key_letter:
+                    self.create_text(x + self.white_key_width / 2, self.white_key_height - 20,
+                                   text=key_letter, fill=FG_DIM, font=(FONT_MAIN, 10))
+                if midi_note in OCTAVE_LABELS:
+                    self.create_text(x + self.white_key_width / 2, 15,
+                                   text=OCTAVE_LABELS[midi_note], fill=FG_BRIGHT, font=(FONT_MAIN, 9, 'bold'))
+                x += self.white_key_width
+        x = 10
+        black_notes = [(1, 0.7), (3, 1.7), (6, 3.7), (8, 4.7), (10, 5.7)]
+        for octave in range(self.num_octaves):
+            for offset, white_key_offset in black_notes:
+                midi_note = self.start_note + (octave * 12) + offset
+                if midi_note in self.key_rects: continue
+                key_letter = None
+                for k, v in BLACK_KEYS.items():
+                    if v == midi_note:
+                        key_letter = k.upper()
+                        break
+                black_x = x + (white_key_offset * self.white_key_width) - (self.black_key_width / 2)
+                rect = self.create_rectangle(black_x, 0, black_x + self.black_key_width, self.black_key_height,
+                                           fill='#1a1a1a', outline=BORDER, width=1)
+                self.key_rects[midi_note] = rect
+                if key_letter:
+                    self.create_text(black_x + self.black_key_width / 2, self.black_key_height - 15,
+                                   text=key_letter, fill=FG_DIM, font=(FONT_MAIN, 9))
+            x += 7 * self.white_key_width
+        self.config(width=x + 10, height=self.white_key_height + 10)
+
+    def highlight_key(self, midi_note, active=True):
+        if midi_note not in self.key_rects: return
+        rect_id = self.key_rects[midi_note]
+        if active:
+            self.itemconfig(rect_id, fill=FG_BRIGHT, outline=FG_WHITE)
+            self.active_keys.add(midi_note)
+        else:
+            is_black = midi_note in [61, 63, 66, 68, 70, 73, 75, 78, 80, 82, 85, 87]
+            self.itemconfig(rect_id, fill='#1a1a1a' if is_black else BG_DARK, outline=BORDER)
+            self.active_keys.discard(midi_note)
+
+def sep(parent, vertical=False):
+    return tk.Frame(parent, bg=BORDER, width=1 if vertical else 100, height=1 if not vertical else 100)
+
+def label(parent, text, size=9, color=FG_DIM, bold=False):
+    return tk.Label(parent, text=text, bg=BG_BLACK, fg=color, font=(FONT_MAIN, size, 'bold' if bold else 'normal'))
+
+class SerumApp:
+    def __init__(self, root):
+        self.root = root
+        root.title('Nill OSC')
+        root.configure(bg=BG_BLACK)
+        root.geometry('1200x900')
+        root.minsize(1000, 800)
+        self.synth = PolyphonicSynth()
+        self._wt_canvases = []
+        self._playing_notes = {}
+        self._waveform_var = tk.StringVar(value='sine')
+        self._waveform_btns = {}
+        self._waveform_index = 0
+        self._osc1_wave_var = tk.StringVar(value='sine')
+        self._osc2_wave_var = tk.StringVar(value='saw')
+        self.stream = None
+        self.display_canvas = None
+        self.animation_id = None
+        self.piano_keyboard = None
+        self._build()
+        root.after(100, self._init_mini_waves)
+        root.after(100, self._start_audio)
+        root.bind('<KeyPress>', self._on_key_press)
+        root.bind('<KeyRelease>', self._on_key_release)
+        root.protocol('WM_DELETE_WINDOW', self._on_closing)
+
+    def _start_audio(self):
+        try:
+            self.stream = sd.OutputStream(channels=1, samplerate=SR, blocksize=BUFFER_SIZE, callback=self._audio_callback)
+            self.stream.start()
+            print("[SYSTEM] Audio stream started")
+        except Exception as e:
+            print(f"[ERROR] Audio: {e}")
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        if status: print(f"[STATUS] {status}")
+        outdata[:, 0] = self.synth.generate_audio(frames)
+
+    def _on_closing(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        if self.animation_id: self.root.after_cancel(self.animation_id)
+        self.root.destroy()
+
+    def _build(self):
+        self._build_titlebar()
+        body = tk.Frame(self.root, bg=BG_BLACK)
+        body.pack(fill='both', expand=True)
+        self._build_left(body)
+        self._build_right(body)
+        self._build_center(body)
+        self._build_keyboard()
+        self._build_bottombar()
+
+    def _build_titlebar(self):
+        bar = tk.Frame(self.root, bg=BG_BLACK, height=35)
+        bar.pack(fill='x')
+        bar.pack_propagate(False)
+        sep(bar).pack(side='bottom', fill='x')
+        label(bar, 'Nill OSC', size=11, color=FG_WHITE, bold=True).pack(side='left', padx=15)
+        right = tk.Frame(bar, bg=BG_BLACK)
+        right.pack(side='right', padx=15)
+        label(right, 'OSC 1 + OSC 2', size=9).pack(side='left', padx=15)
+
+    def _build_bottombar(self):
+        bar = tk.Frame(self.root, bg=BG_BLACK, height=28)
+        bar.pack(fill='x', side='bottom')
+        bar.pack_propagate(False)
+        sep(bar).pack(side='top', fill='x')
+        label(bar, 'PRESET: DEFAULT_PATCH', size=8).pack(side='left', padx=15)
+        self.cpu_label = label(bar, 'VOICES: 0/16', size=8)
+        self.cpu_label.pack(side='right', padx=15)
+
+    def _build_keyboard(self):
+        kb_frame = tk.Frame(self.root, bg=BG_BLACK, height=140)
+        kb_frame.pack(fill='x', side='bottom')
+        sep(kb_frame).pack(side='top', fill='x')
+        self.piano_keyboard = PianoKeyboard(kb_frame, start_note=60, num_octaves=2)
+        self.piano_keyboard.pack(pady=10)
+
+    def _build_left(self, parent):
+        outer = tk.Frame(parent, bg=BG_BLACK, width=320)
+        outer.pack(side='left', fill='y')
+        outer.pack_propagate(False)
+        sep(outer, vertical=True).pack(side='right', fill='y')
+        cv = tk.Canvas(outer, bg=BG_BLACK, highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient='vertical', command=cv.yview,
+                         bg=BG_BLACK, troughcolor=BG_DARK, activebackground=FG_DIM)
+        inner = tk.Frame(cv, bg=BG_BLACK)
+        inner.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        win_id = cv.create_window((0, 0), window=inner, anchor='nw')
+        cv.configure(yscrollcommand=sb.set)
+        cv.bind('<Configure>', lambda e: cv.itemconfig(win_id, width=e.width))
+        def _on_mousewheel(event):
+            cv.yview_scroll(int(-1*(event.delta/120)), 'units')
+        cv.bind('<MouseWheel>', _on_mousewheel)
+        cv.bind('<Button-4>', lambda e: cv.yview_scroll(-1, 'units'))
+        cv.bind('<Button-5>', lambda e: cv.yview_scroll(1, 'units'))
+        cv.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self._build_waveform_selector(inner)
+        self._build_osc(inner, 1, 'OSC 1', 'sine', 0, 100, 0)
+        self._build_osc(inner, 2, 'OSC 2', 'saw', 0, 0, 0)
+
+    def _build_waveform_selector(self, parent):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK)
+        sec.pack(fill='x', padx=12, pady=10)
+        label(sec, '[GLOBAL WAVEFORM]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0, 6))
+        label(sec, 'M=Next N=Previous (overrides OSC)', size=7, color=FG_DIM).pack(anchor='w', pady=(0, 8))
+        btn_frame = tk.Frame(sec, bg=BG_BLACK)
+        btn_frame.pack(fill='x')
+        waveforms = [('sine', 'SINE'), ('triangle', 'TRI'), ('saw', 'SAW'), ('square', 'SQR')]
+        for i, (wave, text) in enumerate(waveforms):
+            row = i // 2; col = i % 2
+            is_active = (wave == 'sine')
+            btn = tk.Button(btn_frame, text=f'[{text}]', bg=FG_BRIGHT if is_active else BORDER,
+                          fg=BG_BLACK if is_active else FG_DIM, font=(FONT_MAIN, 8, 'bold'),
+                          relief='flat', width=6, height=2, cursor='hand2',
+                          command=lambda w=wave: self._set_global_waveform(w))
+            btn.grid(row=row, column=col, padx=4, pady=4, sticky='ew')
+            self._waveform_btns[wave] = btn
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+
+    def _set_global_waveform(self, waveform: str):
+        if waveform not in WAVEFORMS: return
+        self.synth.use_global_waveform = True
+        self.synth.set_waveform(waveform)
+        self._waveform_index = WAVEFORMS.index(waveform)
+        for wave, btn in self._waveform_btns.items():
+            btn.config(bg=FG_BRIGHT if wave == waveform else BORDER,
+                      fg=BG_BLACK if wave == waveform else FG_DIM)
+
+    def _cycle_waveform(self, direction: int):
+        self._waveform_index = (self._waveform_index + direction) % len(WAVEFORMS)
+        self._set_global_waveform(WAVEFORMS[self._waveform_index])
+
+    def _build_osc(self, parent, osc_num, name, wave_type, detune, level, phase):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK)
+        sec.pack(fill='x', padx=12, pady=10)
+        hdr = tk.Frame(sec, bg=BG_BLACK)
+        hdr.pack(fill='x', pady=(0, 8))
+        label(hdr, f'[{name}]', size=9, color=FG_WHITE, bold=True).pack(side='left')
+        on_var = tk.BooleanVar(value=True)
+        tog_btn = tk.Button(hdr, text='[ON]', bg=FG_BRIGHT, fg=BG_BLACK, font=(FONT_MAIN, 8),
+                           relief='flat', width=3, cursor='hand2')
+        tog_btn.pack(side='right')
+        wt_canvas = tk.Canvas(sec, width=280, height=50, bg=BG_BLACK,
+                             highlightthickness=1, highlightbackground=BORDER)
+        wt_canvas.pack(pady=(0, 8))
+        self._wt_canvases.append((wt_canvas, wave_type, 2.0))
+        wave_frame = tk.Frame(sec, bg=BG_BLACK)
+        wave_frame.pack(fill='x', pady=(0, 8))
+        label(wave_frame, 'WAVEFORM:', size=7, color=FG_DIM).pack(anchor='w')
+        wave_btns = tk.Frame(wave_frame, bg=BG_BLACK)
+        wave_btns.pack(fill='x')
+        for wave, text in [('sine', 'SIN'), ('triangle', 'TRI'), ('saw', 'SAW'), ('square', 'SQR')]:
+            btn = tk.Button(wave_btns, text=text, bg=FG_BRIGHT if wave == wave_type else BORDER,
+                          fg=BG_BLACK if wave == wave_type else FG_DIM, font=(FONT_MAIN, 7),
+                          relief='flat', width=5, cursor='hand2',
+                          command=lambda w=wave: self._set_osc_wave(osc_num, w))
+            btn.pack(side='left', padx=2)
+        knob_frame = tk.Frame(sec, bg=BG_BLACK)
+        knob_frame.pack(fill='x')
+        for i, (lbl, init, min_v, max_v, fmt, param) in enumerate([
+            ('DET', 0.5, 0.0, 1.0, lambda v: f'{int((v-0.5)*100):+d}', 'detune'),
+            ('LEV', 1.0 if osc_num == 1 else 0.0, 0.0, 1.0, lambda v: f'{int(v*100)}%', 'level'),
+            ('PHS', 0.0, 0.0, 1.0, lambda v: f'{int(v*360)}°', 'phase')
+        ]):
+            ctrl = tk.Frame(knob_frame, bg=BG_BLACK)
+            ctrl.pack(side='left', expand=True, fill='x', padx=3)
+            val_lbl = label(ctrl, fmt(init), size=9, color=FG_WHITE, bold=True)
+            val_lbl.pack()
+            knob = RotaryKnob(ctrl, value=init, min_val=min_v, max_val=max_v,
+                            label=lbl, size=52, format_fn=fmt,
+                            on_change=lambda v, o=osc_num, p=param, l=val_lbl: self._on_osc_change(o, p, v, l))
+            knob.pack()
+
+    def _set_osc_wave(self, osc_num, waveform):
+        self.synth.use_global_waveform = False
+        self.synth.set_osc_wave(osc_num, waveform)
+
+    def _on_osc_change(self, osc_num, param, value, label):
+        if param == 'detune':
+            label.config(text=f'{int((value-0.5)*100):+d}')
+            self.synth.set_osc_detune(osc_num, int((value - 0.5) * 100))
+        elif param == 'level':
+            label.config(text=f'{int(value*100)}%')
+            self.synth.set_osc_level(osc_num, value)
+        elif param == 'phase':
+            label.config(text=f'{int(value*360)}°')
+            self.synth.set_osc_phase(osc_num, value)
+
+    def _build_right(self, parent):
+        outer = tk.Frame(parent, bg=BG_BLACK, width=320)
+        outer.pack(side='right', fill='y')
+        outer.pack_propagate(False)
+        sep(outer, vertical=True).pack(side='left', fill='y')
+        cv = tk.Canvas(outer, bg=BG_BLACK, highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient='vertical', command=cv.yview,
+                         bg=BG_BLACK, troughcolor=BG_DARK, activebackground=FG_DIM)
+        inner = tk.Frame(cv, bg=BG_BLACK)
+        inner.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        win_id = cv.create_window((0, 0), window=inner, anchor='nw')
+        cv.configure(yscrollcommand=sb.set)
+        cv.bind('<Configure>', lambda e: cv.itemconfig(win_id, width=e.width))
+        cv.bind('<MouseWheel>', lambda e: cv.yview_scroll(int(-1*(e.delta/120)), 'units'))
+        cv.bind('<Button-4>', lambda e: cv.yview_scroll(-1, 'units'))
+        cv.bind('<Button-5>', lambda e: cv.yview_scroll(1, 'units'))
+        cv.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self._build_master(inner)
+        self._build_filter(inner)
+        self._build_effects(inner)
+
+    def _build_master(self, parent):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK)
+        sec.pack(fill='x', padx=12, pady=10)
+        label(sec, '[MASTER]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0, 8))
+        row = tk.Frame(sec, bg=BG_BLACK)
+        row.pack(fill='x')
+        for k in [
+            {'key': 'master_pitch', 'label': 'PITCH', 'initial': 0.5, 'format': lambda v: f'{(v-0.5)*24:+.1f}'},
+            {'key': 'master_glide', 'label': 'GLIDE', 'initial': 0.0, 'format': lambda v: f'{int(v*100)}'},
+            {'key': 'master_level', 'label': 'LEVEL', 'initial': 1.0, 'format': lambda v: f'{int(v*127)}'}
+        ]:
+            self._create_knob_column(row, k)
+
+    def _create_knob_column(self, parent, knob_def):
+        f = tk.Frame(parent, bg=BG_BLACK)
+        f.pack(side='left', expand=True, fill='x')
+        disp = label(f, knob_def['format'](knob_def['initial']), size=9, color=FG_WHITE, bold=True)
+        disp.pack(pady=(0, 4))
+        knob = RotaryKnob(f, value=knob_def['initial'], min_val=0.0, max_val=1.0,
+                         label=knob_def['label'], size=52, format_fn=knob_def['format'])
+        knob.pack()
+        label(f, knob_def['label'], size=7, color=FG_DIM).pack(pady=(4, 0))
+
+    def _build_filter(self, parent):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK)
+        sec.pack(fill='x', padx=12, pady=10)
+        label(sec, '[FILTER]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0, 6))
+        btn_row = tk.Frame(sec, bg=BG_BLACK)
+        btn_row.pack(fill='x', pady=(0, 8))
+        for ft in ['LP', 'HP', 'BP', 'NT']:
+            b = tk.Button(btn_row, text=ft, font=(FONT_MAIN, 8), relief='flat',
+                         bg=BORDER, fg=FG_DIM, activebackground=BG_BLACK,
+                         activeforeground=FG_WHITE, cursor='hand2', width=3)
+            b.pack(side='left', padx=3)
+        row = tk.Frame(sec, bg=BG_BLACK)
+        row.pack(fill='x')
+        for k in [
+            {'key': 'filter_cutoff', 'label': 'CUTOFF', 'initial': 0.5, 'format': lambda v: f'{int(v*100)}'},
+            {'key': 'filter_res', 'label': 'RES', 'initial': 0.3, 'format': lambda v: f'{int(v*100)}'},
+            {'key': 'filter_drive', 'label': 'DRV', 'initial': 0.0, 'format': lambda v: f'{int(v*100)}'}
+        ]:
+            self._create_knob_column(row, k)
+
+    def _build_effects(self, parent):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK)
+        sec.pack(fill='x', padx=12, pady=10)
+        label(sec, '[FX]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0, 6))
+        for fx_name, params in [
+            ('DISTORTION', [{'key': 'fx_dist', 'label': 'AMT', 'initial': 0.0, 'format': lambda v: f'{int(v*100)}%'}]),
+            ('DELAY', [
+                {'key': 'fx_delay_time', 'label': 'TIME', 'initial': 0.3, 'format': lambda v: f'{v:.2f}s'},
+                {'key': 'fx_delay_fdbk', 'label': 'FDBK', 'initial': 0.4, 'format': lambda v: f'{int(v*100)}%'},
+                {'key': 'fx_delay_mix', 'label': 'MIX', 'initial': 0.0, 'format': lambda v: f'{int(v*100)}%'}
+            ]),
+            ('REVERB', [{'key': 'fx_reverb', 'label': 'AMT', 'initial': 0.0, 'format': lambda v: f'{int(v*100)}%'}])
+        ]:
+            box = tk.Frame(sec, bg=BG_PANEL, bd=1, relief='solid')
+            box.pack(fill='x', pady=2)
+            label(tk.Frame(box, bg=BG_PANEL), fx_name, size=7).pack(side='left', padx=5, pady=3)
+            row = tk.Frame(box, bg=BG_PANEL)
+            row.pack(fill='x', padx=5, pady=(0, 4))
+            for k in params:
+                self._create_knob_column(row, k)
+
+    def _build_center(self, parent):
+        frame = tk.Frame(parent, bg=BG_BLACK)
+        frame.pack(side='left', fill='both', expand=True)
+        hdr = tk.Frame(frame, bg=BG_BLACK, height=35)
+        hdr.pack(fill='x')
+        hdr.pack_propagate(False)
+        sep(hdr).pack(side='bottom', fill='x')
+        label(hdr, 'VISUALIZER', size=9, color=FG_WHITE, bold=True).pack(side='left', padx=12, pady=8)
+        content = tk.Frame(frame, bg=BG_BLACK)
+        content.pack(fill='both', expand=True, padx=12, pady=12)
+        self.display_canvas = tk.Canvas(content, bg=BG_BLACK, highlightthickness=1, highlightbackground=BORDER)
+        self.display_canvas.pack(fill='both', expand=True)
+        self._animate_wavetable()
+
+    def _animate_wavetable(self):
+        if not self.display_canvas: return
+        w = self.display_canvas.winfo_width()
+        h = self.display_canvas.winfo_height()
+        if w > 10 and h > 10:
+            self.display_canvas.delete('all')
+            for x in range(0, w + 40, 40):
+                self.display_canvas.create_line(x, 0, x, h, fill=BORDER)
+            for y in range(0, h + 40, 40):
+                self.display_canvas.create_line(0, y, w, y, fill=BORDER)
+            self.display_canvas.create_line(0, h // 2, w, h // 2, fill=FG_DIM, width=1)
+            audio = self.synth.last_buffer
+            pts = []
+            downsample = max(1, len(audio) // w)
+            for i in range(0, len(audio), downsample):
+                x = int((i / len(audio)) * w)
+                y = h // 2 - int(audio[i] * (h / 2.5))
+                pts.extend([x, y])
+            if len(pts) >= 4:
+                self.display_canvas.create_line(pts, fill=FG_WHITE, width=1, smooth=True)
+        self.animation_id = self.root.after(33, self._animate_wavetable)
+
+    def _on_key_press(self, e):
+        key = e.keysym.lower()
+        if key == 'm':
+            self._cycle_waveform(1); return
+        elif key == 'n':
+            self._cycle_waveform(-1); return
+        if key in ALL_KEYS and key not in self._playing_notes:
+            midi_note = ALL_KEYS[key]
+            self._playing_notes[key] = midi_note
+            self.synth.note_on(midi_note)
+            if self.piano_keyboard:
+                self.piano_keyboard.highlight_key(midi_note, True)
+
+    def _on_key_release(self, e):
+        key = e.keysym.lower()
+        if key in self._playing_notes:
+            midi_note = self._playing_notes.pop(key)
+            self.synth.note_off(midi_note)
+            if self.piano_keyboard:
+                self.piano_keyboard.highlight_key(midi_note, False)
+
+    def _init_mini_waves(self):
+        for canvas, wtype, freq in self._wt_canvases:
+            canvas.delete('all')
+            canvas.configure(bg=BG_BLACK)
+            w = canvas.winfo_width() or 280
+            h = canvas.winfo_height() or 50
+            for i in range(5):
+                canvas.create_line(0, int(h / 4 * i), w, int(h / 4 * i), fill=BORDER, width=1)
+            pts = []
+            for x in range(w):
+                t = (x / w) * math.pi * 2 * freq
+                if wtype == 'sine': y = math.sin(t)
+                elif wtype == 'saw': y = 2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1
+                elif wtype == 'square': y = 1 if t % (math.pi * 2) < math.pi else -1
+                else: y = 2 * abs(2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1) - 1
+                pts.extend([x, h / 2 - y * h / 2.5])
+            if len(pts) >= 4:
+                canvas.create_line(pts, fill=FG_WHITE, width=1, smooth=True)
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    app = SerumApp(root)
+    root.mainloop()
+'''
 
 
-
-EMBEDDED_OSC_CODE = '"""\nNill OSC\nFOCUS: LEFT PANEL (OSC 1 & OSC 2) - FULLY FUNCTIONAL\n\nFEATURES (THIS VERSION):\n1. OSC 1-2 - Waveform, Detune, Level, Phase (All Working)\n2. Working Scrollbars (Left & Right Panels)\n3. Double-Click Knob Reset\n4. Visual Piano Keyboard\n5. M/N Waveform Cycling (Global Override)\n6. Thread-safe Audio Engine\n"""\n\nimport tkinter as tk\nfrom tkinter import Canvas\nimport math\nimport numpy as np\nfrom typing import Dict, List, Optional, Callable\nimport threading\nimport time\nimport sounddevice as sd\n\n# --- Terminal Greyscale Palette ---\nBG_BLACK = \'#000000\'\nBG_DARK = \'#111111\'\nBG_PANEL = \'#0a0a0a\'\nFG_WHITE = \'#FFFFFF\'\nFG_DIM = \'#666666\'\nFG_BRIGHT = \'#CCCCCC\'\nBORDER = \'#333333\'\nKNOB_BODY = \'#505050\'\nKNOB_SURFACE = \'#1a1a1a\'\nFONT_MAIN = \'Consolas\'\n\nSR = 44100\nBUFFER_SIZE = 2048\nAMP = 0.08\n\nWAVEFORMS = [\'sine\', \'triangle\', \'saw\', \'square\']\nWHITE_KEYS = {\'a\': 60, \'s\': 62, \'d\': 64, \'f\': 65, \'g\': 67, \'h\': 69, \'j\': 71, \'k\': 72, \'l\': 74, \';\': 76, "\'": 77}\nBLACK_KEYS = {\'w\': 61, \'e\': 63, \'t\': 66, \'y\': 68, \'u\': 70, \'o\': 73, \'p\': 75}\nALL_KEYS = {**WHITE_KEYS, **BLACK_KEYS}\nOCTAVE_LABELS = {60: \'C3\', 72: \'C4\', 84: \'C5\'}\n\n\nclass PolyphonicSynth:\n    def __init__(self) -> None:\n        self.active_notes: Dict[int, Dict] = {}\n        self.sample_rate = SR\n        self.buffer_size = BUFFER_SIZE\n        self._lock = threading.Lock()\n        self.last_buffer = np.zeros(BUFFER_SIZE, dtype=np.float32)\n        \n        # Global waveform override (M/N cycling)\n        self.waveform_type = \'sine\'\n        self.use_global_waveform = False\n        \n        # OSC 1 Parameters\n        self.osc1_wave = \'sine\'\n        self.osc1_detune = 0.0\n        self.osc1_level = 1.0\n        self.osc1_phase = 0.0\n        \n        # OSC 2 Parameters\n        self.osc2_wave = \'saw\'\n        self.osc2_detune = 0.0\n        self.osc2_level = 0.0\n        self.osc2_phase = 0.0\n        \n        # FX Parameters\n        self.fx_distortion = 0.0\n        self.fx_delay_time = 0.3\n        self.fx_delay_feedback = 0.4\n        self.fx_delay_mix = 0.0\n        self.fx_reverb_mix = 0.0\n        self.delay_buffer_size = int(SR * 2.0)\n        self.delay_buffer = np.zeros(self.delay_buffer_size, dtype=np.float32)\n        self.delay_write_idx = 0\n\n        # ADSR Envelope parameters\n        self.attack_time = 0.01   # seconds\n        self.decay_time = 0.1     # seconds\n        self.sustain_level = 0.8  # 0-1\n        self.release_time = 0.3   # seconds\n\n    def set_waveform(self, waveform: str) -> None:\n        with self._lock:\n            self.waveform_type = waveform\n\n    def set_osc_wave(self, osc: int, wave: str) -> None:\n        with self._lock:\n            if osc == 1:\n                self.osc1_wave = wave\n            elif osc == 2:\n                self.osc2_wave = wave\n\n    def set_osc_detune(self, osc: int, value: float) -> None:\n        with self._lock:\n            if osc == 1:\n                self.osc1_detune = value\n            elif osc == 2:\n                self.osc2_detune = value\n\n    def set_osc_level(self, osc: int, value: float) -> None:\n        with self._lock:\n            if osc == 1:\n                self.osc1_level = value\n            elif osc == 2:\n                self.osc2_level = value\n\n    def set_osc_phase(self, osc: int, value: float) -> None:\n        with self._lock:\n            if osc == 1:\n                self.osc1_phase = value\n            elif osc == 2:\n                self.osc2_phase = value\n\n    def note_on(self, midi_note: int) -> None:\n        with self._lock:\n            freq = 440 * (2 ** ((midi_note - 69) / 12))\n            self.active_notes[midi_note] = {\n                \'freq\': freq, \n                \'phase1\': self.osc1_phase * np.pi * 2, \n                \'phase2\': self.osc2_phase * np.pi * 2, \n                \'vel\': 0.8,\n                \'start_time\': time.time(),\n                \'envelope_stage\': \'attack\',\n                \'envelope_value\': 0.0,\n                \'release_start\': None\n            }\n\n    def note_off(self, midi_note: int) -> None:\n        with self._lock:\n            if midi_note in self.active_notes:\n                note = self.active_notes[midi_note]\n                if note[\'envelope_stage\'] != \'release\':\n                    note[\'envelope_stage\'] = \'release\'\n                    note[\'release_start\'] = time.time()\n\n    def _get_envelope_value(self, note: Dict, current_time: float) -> float:\n        """Calculate current envelope value based on ADSR stage"""\n        elapsed = current_time - note[\'start_time\']\n\n        if note[\'envelope_stage\'] == \'attack\':\n            if elapsed < self.attack_time:\n                return elapsed / self.attack_time\n            else:\n                note[\'envelope_stage\'] = \'decay\'\n                elapsed -= self.attack_time\n\n        if note[\'envelope_stage\'] == \'decay\':\n            if elapsed < self.decay_time:\n                decay_amount = 1.0 - self.sustain_level\n                return 1.0 - decay_amount * (elapsed / self.decay_time)\n            else:\n                note[\'envelope_stage\'] = \'sustain\'\n                return self.sustain_level\n\n        if note[\'envelope_stage\'] == \'sustain\':\n            return self.sustain_level\n\n        if note[\'envelope_stage\'] == \'release\':\n            if note[\'release_start\'] is None:\n                return 0.0\n            release_elapsed = current_time - note[\'release_start\']\n            if release_elapsed >= self.release_time:\n                return 0.0\n            else:\n                sustain_value = note.get(\'envelope_value\', self.sustain_level)\n                return sustain_value * (1.0 - release_elapsed / self.release_time)\n\n        return 0.0\n\n    def set_effect_param(self, name: str, value: float) -> None:\n        with self._lock:\n            if name == \'distortion\': self.fx_distortion = value\n            elif name == \'delay_time\': self.fx_delay_time = value\n            elif name == \'delay_feedback\': self.fx_delay_feedback = value\n            elif name == \'delay_mix\': self.fx_delay_mix = value\n            elif name == \'reverb_mix\': self.fx_reverb_mix = value\n\n    def _apply_effects(self, buffer: np.ndarray) -> np.ndarray:\n        if self.fx_distortion > 0.01:\n            drive = 1.0 + (self.fx_distortion * 10.0)\n            buffer = np.tanh(buffer * drive)\n        if self.fx_delay_mix > 0.01 or self.fx_reverb_mix > 0.01:\n            delay_samples = int(self.fx_delay_time * self.sample_rate)\n            delay_samples = max(1, min(delay_samples, self.delay_buffer_size - 1))\n            wet_mix = max(self.fx_delay_mix, self.fx_reverb_mix)\n            feedback = self.fx_delay_feedback\n            if self.fx_reverb_mix > 0.5: feedback = 0.7 + (self.fx_reverb_mix * 0.25)\n            output = np.zeros_like(buffer)\n            for i in range(len(buffer)):\n                read_idx = int(self.delay_write_idx - delay_samples)\n                if read_idx < 0: read_idx += self.delay_buffer_size\n                delayed_sample = self.delay_buffer[read_idx]\n                self.delay_buffer[self.delay_write_idx] = buffer[i] + (delayed_sample * feedback)\n                output[i] = (buffer[i] * (1.0 - wet_mix)) + (delayed_sample * wet_mix)\n                self.delay_write_idx += 1\n                if self.delay_write_idx >= self.delay_buffer_size: self.delay_write_idx = 0\n            buffer = output\n        return buffer\n\n    def _generate_wave(self, phases: np.ndarray, wave_type: str, detune_cents: float) -> np.ndarray:\n        if detune_cents != 0.0:\n            detune_ratio = 2 ** (detune_cents / 1200.0)\n            phases = (phases * detune_ratio) % 1.0\n        \n        if wave_type == \'sine\':\n            return np.sin(2 * np.pi * phases)\n        elif wave_type == \'square\':\n            return np.where(phases < 0.5, 1.0, -1.0)\n        elif wave_type == \'saw\':\n            return 2 * (phases - 0.5)\n        elif wave_type == \'triangle\':\n            return 2 * np.abs(2 * (phases - 0.5)) - 1\n        return np.sin(2 * np.pi * phases)\n\n    def generate_audio(self, num_samples: int) -> np.ndarray:\n        buffer = np.zeros(num_samples, dtype=np.float32)\n        current_time = time.time()\n        \n        with self._lock:\n            active_count = len(self.active_notes)\n            \n            if active_count == 0:\n                buffer = self._apply_effects(buffer)\n                self.last_buffer = buffer\n                return buffer\n            \n            notes_to_remove = []\n            \n            for midi_note, note_data in list(self.active_notes.items()):\n                envelope = self._get_envelope_value(note_data, current_time)\n                note_data[\'envelope_value\'] = envelope\n\n                if envelope <= 0.001:  # Very quiet, remove note\n                    notes_to_remove.append(midi_note)\n                    continue\n\n                freq = note_data[\'freq\']\n                phase1 = note_data[\'phase1\']\n                phase2 = note_data[\'phase2\']\n                vel = note_data[\'vel\']\n                \n                t = np.arange(num_samples)\n                \n                phases1 = (phase1 / (np.pi * 2) + (freq / self.sample_rate) * t) % 1.0\n                phases2 = (phase2 / (np.pi * 2) + (freq / self.sample_rate) * t) % 1.0\n                \n                wave1 = self.waveform_type if self.use_global_waveform else self.osc1_wave\n                wave2 = self.waveform_type if self.use_global_waveform else self.osc2_wave\n                \n                osc1 = self._generate_wave(phases1, wave1, self.osc1_detune)\n                osc2 = self._generate_wave(phases2, wave2, self.osc2_detune)\n                \n                mix = (osc1 * self.osc1_level) + (osc2 * self.osc2_level)\n                buffer += mix * vel * envelope  # Apply envelope\n                \n                # Update phases for next buffer\n                note_data[\'phase1\'] = phases1[-1] * 2 * np.pi\n                note_data[\'phase2\'] = phases2[-1] * 2 * np.pi\n            \n            # Remove finished notes\n            for midi_note in notes_to_remove:\n                del self.active_notes[midi_note]\n            \n            if active_count > 1:\n                max_val = np.max(np.abs(buffer))\n                if max_val > 0: buffer = buffer / max_val * 0.9\n            buffer *= AMP\n        \n        buffer = self._apply_effects(buffer)\n        buffer = np.clip(buffer, -1.0, 1.0)\n        self.last_buffer = buffer\n        return buffer\n\n\nclass RotaryKnob(Canvas):\n    def __init__(self, parent, value=0.0, min_val=0.0, max_val=1.0, \n                 label="", format_fn=None, on_change=None, size=52, **kw):\n        super().__init__(parent, width=size + 40, height=size + 60, \n                        bg=BG_BLACK, highlightthickness=0, **kw)\n        \n        self.value = value\n        self.default_value = value\n        self.min_val = min_val\n        self.max_val = max_val\n        self.label = label\n        self.format_fn = format_fn or (lambda v: f\'{v:.0f}\')\n        self.on_change = on_change\n        self.size = size\n        self.radius = size / 2\n        self.center_x = self.radius + 20\n        self.center_y = self.radius + 30\n        self.min_angle = -135\n        self.max_angle = 135\n        self.is_dragging = False\n        self.drag_start_y = 0\n        self.drag_start_value = 0\n        \n        self.bind(\'<Button-1>\', self._on_mouse_down)\n        self.bind(\'<B1-Motion>\', self._on_mouse_drag)\n        self.bind(\'<ButtonRelease-1>\', self._on_mouse_up)\n        self.bind(\'<Double-Button-1>\', self._on_double_click)\n        self.bind(\'<MouseWheel>\', self._on_mouse_wheel)\n        self.bind(\'<Button-4>\', self._on_mouse_wheel)\n        self.bind(\'<Button-5>\', self._on_mouse_wheel)\n        \n        self.draw()\n    \n    def _get_angle(self):\n        if self.max_val == self.min_val:\n            return self.min_angle\n        normalized = (self.value - self.min_val) / (self.max_val - self.min_val)\n        return self.min_angle + normalized * (self.max_angle - self.min_angle)\n    \n    def set_value(self, value):\n        old_value = self.value\n        self.value = max(self.min_val, min(self.max_val, value))\n        if abs(self.value - old_value) > 0.001:\n            self.draw()\n            if self.on_change:\n                self.on_change(self.value)\n    \n    def reset_to_default(self):\n        if abs(self.value - self.default_value) > 0.001:\n            self.set_value(self.default_value)\n    \n    def _on_mouse_down(self, event):\n        dx = event.x - self.center_x\n        dy = event.y - self.center_y\n        distance = math.sqrt(dx**2 + dy**2)\n        if distance < self.radius * 0.8:\n            self.is_dragging = True\n            self.drag_start_y = event.y_root\n            self.drag_start_value = self.value\n            self.config(cursor=\'fleur\')\n    \n    def _on_mouse_drag(self, event):\n        if not self.is_dragging:\n            return\n        delta_y = self.drag_start_y - event.y_root\n        sensitivity = (self.max_val - self.min_val) / 200\n        self.set_value(self.drag_start_value + delta_y * sensitivity)\n    \n    def _on_mouse_up(self, event):\n        self.is_dragging = False\n        self.config(cursor=\'hand2\')\n    \n    def _on_double_click(self, event):\n        dx = event.x - self.center_x\n        dy = event.y - self.center_y\n        distance = math.sqrt(dx**2 + dy**2)\n        if distance < self.radius * 0.8:\n            self.reset_to_default()\n    \n    def _on_mouse_wheel(self, event):\n        delta = 0.02 if (event.num == 4 or event.delta > 0) else -0.02\n        self.set_value(self.value + delta * (self.max_val - self.min_val))\n        return \'break\'\n    \n    def draw(self):\n        self.delete(\'all\')\n        angle = self._get_angle()\n        angle_rad = math.radians(angle)\n        \n        self.create_oval(self.center_x - self.radius, self.center_y - self.radius,\n                        self.center_x + self.radius, self.center_y + self.radius,\n                        fill=KNOB_BODY, outline=BORDER, width=1)\n        \n        inner_r = self.radius * 0.75\n        self.create_oval(self.center_x - inner_r, self.center_y - inner_r,\n                        self.center_x + inner_r, self.center_y + inner_r,\n                        fill=KNOB_SURFACE, outline=BORDER, width=1)\n        \n        arc_radius = self.radius * 0.90\n        if self.value > self.min_val:\n            self.create_arc(self.center_x - arc_radius, self.center_y - arc_radius,\n                          self.center_x + arc_radius, self.center_y + arc_radius,\n                          start=self.min_angle, extent=angle - self.min_angle,\n                          style=\'arc\', outline=FG_BRIGHT, width=3)\n        \n        line_start_r = self.radius * 0.2\n        line_end_r = self.radius * 0.6\n        start_x = self.center_x + line_start_r * math.cos(angle_rad - math.pi/2)\n        start_y = self.center_y + line_start_r * math.sin(angle_rad - math.pi/2)\n        end_x = self.center_x + line_end_r * math.cos(angle_rad - math.pi/2)\n        end_y = self.center_y + line_end_r * math.sin(angle_rad - math.pi/2)\n        self.create_line(start_x, start_y, end_x, end_y, fill=FG_BRIGHT, width=2)\n        \n        self.create_oval(self.center_x - self.radius * 0.15, self.center_y - self.radius * 0.15,\n                        self.center_x + self.radius * 0.15, self.center_y + self.radius * 0.15,\n                        fill=BORDER, outline=KNOB_SURFACE, width=1)\n        \n        self.create_text(self.center_x, self.center_y + self.radius + 25,\n                        text=self.label.upper(), font=(FONT_MAIN, 7, \'bold\'), fill=FG_DIM)\n        self.create_text(self.center_x, 12, text=self.format_fn(self.value),\n                        font=(FONT_MAIN, 9, \'bold\'), fill=FG_WHITE)\n\n\nclass PianoKeyboard(Canvas):\n    def __init__(self, parent, start_note=60, num_octaves=2, **kw):\n        super().__init__(parent, bg=BG_BLACK, highlightthickness=0, **kw)\n        self.start_note = start_note\n        self.num_octaves = num_octaves\n        self.white_key_width = 40\n        self.black_key_width = 24\n        self.white_key_height = 120\n        self.black_key_height = 75\n        self.active_keys = set()\n        self.key_rects = {}\n        self._draw_keyboard()\n    \n    def _draw_keyboard(self):\n        self.delete(\'all\')\n        self.key_rects = {}\n        x = 10\n        white_notes = [0, 2, 4, 5, 7, 9, 11]\n        \n        for octave in range(self.num_octaves):\n            for offset in white_notes:\n                midi_note = self.start_note + (octave * 12) + offset\n                key_letter = None\n                for k, v in WHITE_KEYS.items():\n                    if v == midi_note:\n                        key_letter = k.upper()\n                        break\n                \n                rect = self.create_rectangle(x, 0, x + self.white_key_width, self.white_key_height,\n                                           fill=BG_DARK, outline=BORDER, width=1)\n                self.key_rects[midi_note] = rect\n                \n                if key_letter:\n                    self.create_text(x + self.white_key_width / 2, self.white_key_height - 20,\n                                   text=key_letter, fill=FG_DIM, font=(FONT_MAIN, 10))\n                if midi_note in OCTAVE_LABELS:\n                    self.create_text(x + self.white_key_width / 2, 15,\n                                   text=OCTAVE_LABELS[midi_note], fill=FG_BRIGHT, font=(FONT_MAIN, 9, \'bold\'))\n                x += self.white_key_width\n        \n        x = 10\n        black_notes = [(1, 0.7), (3, 1.7), (6, 3.7), (8, 4.7), (10, 5.7)]\n        for octave in range(self.num_octaves):\n            for offset, white_key_offset in black_notes:\n                midi_note = self.start_note + (octave * 12) + offset\n                if midi_note in self.key_rects:\n                    continue\n                key_letter = None\n                for k, v in BLACK_KEYS.items():\n                    if v == midi_note:\n                        key_letter = k.upper()\n                        break\n                black_x = x + (white_key_offset * self.white_key_width) - (self.black_key_width / 2)\n                rect = self.create_rectangle(black_x, 0, black_x + self.black_key_width, self.black_key_height,\n                                           fill=\'#1a1a1a\', outline=BORDER, width=1)\n                self.key_rects[midi_note] = rect\n                if key_letter:\n                    self.create_text(black_x + self.black_key_width / 2, self.black_key_height - 15,\n                                   text=key_letter, fill=FG_DIM, font=(FONT_MAIN, 9))\n            x += 7 * self.white_key_width\n        \n        self.config(width=x + 10, height=self.white_key_height + 10)\n    \n    def highlight_key(self, midi_note, active=True):\n        if midi_note not in self.key_rects:\n            return\n        rect_id = self.key_rects[midi_note]\n        if active:\n            self.itemconfig(rect_id, fill=FG_BRIGHT, outline=FG_WHITE)\n            self.active_keys.add(midi_note)\n        else:\n            is_black = midi_note in [61, 63, 66, 68, 70, 73, 75, 78, 80, 82, 85, 87]\n            self.itemconfig(rect_id, fill=\'#1a1a1a\' if is_black else BG_DARK, outline=BORDER)\n            self.active_keys.discard(midi_note)\n\n\ndef sep(parent, vertical=False):\n    return tk.Frame(parent, bg=BORDER, width=1 if vertical else 100, height=1 if not vertical else 100)\n\ndef label(parent, text, size=9, color=FG_DIM, bold=False):\n    return tk.Label(parent, text=text, bg=BG_BLACK, fg=color, font=(FONT_MAIN, size, \'bold\' if bold else \'normal\'))\n\n\nclass SerumApp:\n    def __init__(self, root):\n        self.root = root\n        root.title(\'Nill OSC\')\n        root.configure(bg=BG_BLACK)\n        root.geometry(\'1200x900\')\n        root.minsize(1000, 800)\n        \n        self.synth = PolyphonicSynth()\n        self._wt_canvases = []\n        self._playing_notes = {}\n        self._waveform_var = tk.StringVar(value=\'sine\')\n        self._waveform_btns = {}\n        self._waveform_index = 0\n        self._osc1_wave_var = tk.StringVar(value=\'sine\')\n        self._osc2_wave_var = tk.StringVar(value=\'saw\')\n        \n        self.stream = None\n        self.display_canvas = None\n        self.animation_id = None\n        self.piano_keyboard = None\n        \n        self._build()\n        root.after(100, self._init_mini_waves)\n        root.after(100, self._start_audio)\n        root.bind(\'<KeyPress>\', self._on_key_press)\n        root.bind(\'<KeyRelease>\', self._on_key_release)\n        root.protocol(\'WM_DELETE_WINDOW\', self._on_closing)\n\n    def _start_audio(self):\n        try:\n            self.stream = sd.OutputStream(channels=1, samplerate=SR, blocksize=BUFFER_SIZE, callback=self._audio_callback)\n            self.stream.start()\n            print("[SYSTEM] Audio stream started")\n        except Exception as e:\n            print(f"[ERROR] Audio: {e}")\n\n    def _audio_callback(self, outdata, frames, time_info, status):\n        if status:\n            print(f"[STATUS] {status}")\n        outdata[:, 0] = self.synth.generate_audio(frames)\n\n    def _on_closing(self):\n        if self.stream:\n            self.stream.stop()\n            self.stream.close()\n        if self.animation_id:\n            self.root.after_cancel(self.animation_id)\n        self.root.destroy()\n\n    def _build(self):\n        self._build_titlebar()\n        body = tk.Frame(self.root, bg=BG_BLACK)\n        body.pack(fill=\'both\', expand=True)\n        self._build_left(body)\n        self._build_right(body)\n        self._build_center(body)\n        self._build_keyboard()\n        self._build_bottombar()\n\n    def _build_titlebar(self):\n        bar = tk.Frame(self.root, bg=BG_BLACK, height=35)\n        bar.pack(fill=\'x\')\n        bar.pack_propagate(False)\n        sep(bar).pack(side=\'bottom\', fill=\'x\')\n        label(bar, \'Nill OSC\', size=11, color=FG_WHITE, bold=True).pack(side=\'left\', padx=15)\n        right = tk.Frame(bar, bg=BG_BLACK)\n        right.pack(side=\'right\', padx=15)\n        label(right, \'OSC 1 + OSC 2\', size=9).pack(side=\'left\', padx=15)\n\n    def _build_bottombar(self):\n        bar = tk.Frame(self.root, bg=BG_BLACK, height=28)\n        bar.pack(fill=\'x\', side=\'bottom\')\n        bar.pack_propagate(False)\n        sep(bar).pack(side=\'top\', fill=\'x\')\n        label(bar, \'PRESET: DEFAULT_PATCH\', size=8).pack(side=\'left\', padx=15)\n        self.cpu_label = label(bar, \'VOICES: 0/16\', size=8)\n        self.cpu_label.pack(side=\'right\', padx=15)\n\n    def _build_keyboard(self):\n        kb_frame = tk.Frame(self.root, bg=BG_BLACK, height=140)\n        kb_frame.pack(fill=\'x\', side=\'bottom\')\n        sep(kb_frame).pack(side=\'top\', fill=\'x\')\n        self.piano_keyboard = PianoKeyboard(kb_frame, start_note=60, num_octaves=2)\n        self.piano_keyboard.pack(pady=10)\n\n    def _build_left(self, parent):\n        """Left panel with OSC 1 & OSC 2 - WORKING SCROLLBAR"""\n        outer = tk.Frame(parent, bg=BG_BLACK, width=320)\n        outer.pack(side=\'left\', fill=\'y\')\n        outer.pack_propagate(False)\n        sep(outer, vertical=True).pack(side=\'right\', fill=\'y\')\n        \n        # Canvas with scrollbar\n        cv = tk.Canvas(outer, bg=BG_BLACK, highlightthickness=0)\n        sb = tk.Scrollbar(outer, orient=\'vertical\', command=cv.yview, \n                         bg=BG_BLACK, troughcolor=BG_DARK, activebackground=FG_DIM)\n        inner = tk.Frame(cv, bg=BG_BLACK)\n        \n        inner.bind(\'<Configure>\', lambda e: cv.configure(scrollregion=cv.bbox(\'all\')))\n        win_id = cv.create_window((0, 0), window=inner, anchor=\'nw\')\n        cv.configure(yscrollcommand=sb.set)\n        cv.bind(\'<Configure>\', lambda e: cv.itemconfig(win_id, width=e.width))\n        \n        # Mouse wheel scrolling\n        def _on_mousewheel(event):\n            cv.yview_scroll(int(-1*(event.delta/120)), \'units\')\n        cv.bind(\'<MouseWheel>\', _on_mousewheel)\n        cv.bind(\'<Button-4>\', lambda e: cv.yview_scroll(-1, \'units\'))\n        cv.bind(\'<Button-5>\', lambda e: cv.yview_scroll(1, \'units\'))\n        \n        cv.pack(side=\'left\', fill=\'both\', expand=True)\n        sb.pack(side=\'right\', fill=\'y\')\n        \n        # Build sections\n        self._build_waveform_selector(inner)\n        self._build_osc(inner, 1, \'OSC 1\', \'sine\', 0, 100, 0)\n        self._build_osc(inner, 2, \'OSC 2\', \'saw\', 0, 0, 0)\n\n    def _build_waveform_selector(self, parent):\n        sep(parent).pack(fill=\'x\')\n        sec = tk.Frame(parent, bg=BG_BLACK)\n        sec.pack(fill=\'x\', padx=12, pady=10)\n        \n        label(sec, \'[GLOBAL WAVEFORM]\', size=9, color=FG_WHITE, bold=True).pack(anchor=\'w\', pady=(0, 6))\n        label(sec, \'M=Next N=Previous (overrides OSC)\', size=7, color=FG_DIM).pack(anchor=\'w\', pady=(0, 8))\n        \n        btn_frame = tk.Frame(sec, bg=BG_BLACK)\n        btn_frame.pack(fill=\'x\')\n        \n        waveforms = [(\'sine\', \'SINE\'), (\'triangle\', \'TRI\'), (\'saw\', \'SAW\'), (\'square\', \'SQR\')]\n        for i, (wave, text) in enumerate(waveforms):\n            row = i // 2\n            col = i % 2\n            is_active = (wave == \'sine\')\n            btn = tk.Button(btn_frame, text=f\'[{text}]\', bg=FG_BRIGHT if is_active else BORDER,\n                          fg=BG_BLACK if is_active else FG_DIM, font=(FONT_MAIN, 8, \'bold\'),\n                          relief=\'flat\', width=6, height=2, cursor=\'hand2\',\n                          command=lambda w=wave: self._set_global_waveform(w))\n            btn.grid(row=row, column=col, padx=4, pady=4, sticky=\'ew\')\n            self._waveform_btns[wave] = btn\n        \n        btn_frame.columnconfigure(0, weight=1)\n        btn_frame.columnconfigure(1, weight=1)\n\n    def _set_global_waveform(self, waveform: str):\n        if waveform not in WAVEFORMS:\n            return\n        self.synth.use_global_waveform = True\n        self.synth.set_waveform(waveform)\n        self._waveform_index = WAVEFORMS.index(waveform)\n        for wave, btn in self._waveform_btns.items():\n            btn.config(bg=FG_BRIGHT if wave == waveform else BORDER, \n                      fg=BG_BLACK if wave == waveform else FG_DIM)\n\n    def _cycle_waveform(self, direction: int):\n        self._waveform_index = (self._waveform_index + direction) % len(WAVEFORMS)\n        self._set_global_waveform(WAVEFORMS[self._waveform_index])\n\n    def _build_osc(self, parent, osc_num, name, wave_type, detune, level, phase):\n        """Build OSC section with waveform buttons + 4 knobs"""\n        sep(parent).pack(fill=\'x\')\n        sec = tk.Frame(parent, bg=BG_BLACK)\n        sec.pack(fill=\'x\', padx=12, pady=10)\n        \n        # Header\n        hdr = tk.Frame(sec, bg=BG_BLACK)\n        hdr.pack(fill=\'x\', pady=(0, 8))\n        label(hdr, f\'[{name}]\', size=9, color=FG_WHITE, bold=True).pack(side=\'left\')\n        \n        on_var = tk.BooleanVar(value=True)\n        tog_btn = tk.Button(hdr, text=\'[ON]\', bg=FG_BRIGHT, fg=BG_BLACK, font=(FONT_MAIN, 8),\n                           relief=\'flat\', width=3, cursor=\'hand2\')\n        tog_btn.pack(side=\'right\')\n        \n        # Wavetable display\n        wt_canvas = tk.Canvas(sec, width=280, height=50, bg=BG_BLACK, \n                             highlightthickness=1, highlightbackground=BORDER)\n        wt_canvas.pack(pady=(0, 8))\n        self._wt_canvases.append((wt_canvas, wave_type, 2.0))\n        \n        # Waveform buttons\n        wave_frame = tk.Frame(sec, bg=BG_BLACK)\n        wave_frame.pack(fill=\'x\', pady=(0, 8))\n        label(wave_frame, \'WAVEFORM:\', size=7, color=FG_DIM).pack(anchor=\'w\')\n        \n        wave_btns = tk.Frame(wave_frame, bg=BG_BLACK)\n        wave_btns.pack(fill=\'x\')\n        for wave, text in [(\'sine\', \'SIN\'), (\'triangle\', \'TRI\'), (\'saw\', \'SAW\'), (\'square\', \'SQR\')]:\n            btn = tk.Button(wave_btns, text=text, bg=FG_BRIGHT if wave == wave_type else BORDER,\n                          fg=BG_BLACK if wave == wave_type else FG_DIM, font=(FONT_MAIN, 7),\n                          relief=\'flat\', width=5, cursor=\'hand2\',\n                          command=lambda w=wave: self._set_osc_wave(osc_num, w))\n            btn.pack(side=\'left\', padx=2)\n        \n        # 4 Knobs in a row: Detune, Level, Phase\n        knob_frame = tk.Frame(sec, bg=BG_BLACK)\n        knob_frame.pack(fill=\'x\')\n        for i, (lbl, init, min_v, max_v, fmt, param) in enumerate([\n            (\'DET\', 0.5, 0.0, 1.0, lambda v: f\'{int((v-0.5)*100):+d}\', \'detune\'),\n            (\'LEV\', 1.0 if osc_num == 1 else 0.0, 0.0, 1.0, lambda v: f\'{int(v*100)}%\', \'level\'),\n            (\'PHS\', 0.0, 0.0, 1.0, lambda v: f\'{int(v*360)}°\', \'phase\')\n        ]):\n            ctrl = tk.Frame(knob_frame, bg=BG_BLACK)\n            ctrl.pack(side=\'left\', expand=True, fill=\'x\', padx=3)\n            \n            val_lbl = label(ctrl, fmt(init), size=9, color=FG_WHITE, bold=True)\n            val_lbl.pack()\n            \n            knob = RotaryKnob(ctrl, value=init, min_val=min_v, max_val=max_v,\n                            label=lbl, size=52, format_fn=fmt,\n                            on_change=lambda v, o=osc_num, p=param, l=val_lbl: self._on_osc_change(o, p, v, l))\n            knob.pack()\n\n    def _set_osc_wave(self, osc_num, waveform):\n        self.synth.use_global_waveform = False\n        self.synth.set_osc_wave(osc_num, waveform)\n    \n    def _on_osc_change(self, osc_num, param, value, label):\n        if param == \'detune\':\n            label.config(text=f\'{int((value-0.5)*100):+d}\')\n            self.synth.set_osc_detune(osc_num, int((value - 0.5) * 100))\n        elif param == \'level\':\n            label.config(text=f\'{int(value*100)}%\')\n            self.synth.set_osc_level(osc_num, value)\n        elif param == \'phase\':\n            label.config(text=f\'{int(value*360)}°\')\n            self.synth.set_osc_phase(osc_num, value)\n\n    def _build_right(self, parent):\n        """Right panel - Master, Filter, FX (as before)"""\n        outer = tk.Frame(parent, bg=BG_BLACK, width=320)\n        outer.pack(side=\'right\', fill=\'y\')\n        outer.pack_propagate(False)\n        sep(outer, vertical=True).pack(side=\'left\', fill=\'y\')\n        \n        cv = tk.Canvas(outer, bg=BG_BLACK, highlightthickness=0)\n        sb = tk.Scrollbar(outer, orient=\'vertical\', command=cv.yview, \n                         bg=BG_BLACK, troughcolor=BG_DARK, activebackground=FG_DIM)\n        inner = tk.Frame(cv, bg=BG_BLACK)\n        \n        inner.bind(\'<Configure>\', lambda e: cv.configure(scrollregion=cv.bbox(\'all\')))\n        win_id = cv.create_window((0, 0), window=inner, anchor=\'nw\')\n        cv.configure(yscrollcommand=sb.set)\n        cv.bind(\'<Configure>\', lambda e: cv.itemconfig(win_id, width=e.width))\n        cv.bind(\'<MouseWheel>\', lambda e: cv.yview_scroll(int(-1*(e.delta/120)), \'units\'))\n        cv.bind(\'<Button-4>\', lambda e: cv.yview_scroll(-1, \'units\'))\n        cv.bind(\'<Button-5>\', lambda e: cv.yview_scroll(1, \'units\'))\n        \n        cv.pack(side=\'left\', fill=\'both\', expand=True)\n        sb.pack(side=\'right\', fill=\'y\')\n        \n        self._build_master(inner)\n        self._build_filter(inner)\n        self._build_effects(inner)\n\n    def _build_master(self, parent):\n        sep(parent).pack(fill=\'x\')\n        sec = tk.Frame(parent, bg=BG_BLACK)\n        sec.pack(fill=\'x\', padx=12, pady=10)\n        label(sec, \'[MASTER]\', size=9, color=FG_WHITE, bold=True).pack(anchor=\'w\', pady=(0, 8))\n        \n        row = tk.Frame(sec, bg=BG_BLACK)\n        row.pack(fill=\'x\')\n        for k in [\n            {\'key\': \'master_pitch\', \'label\': \'PITCH\', \'initial\': 0.5, \'format\': lambda v: f\'{(v-0.5)*24:+.1f}\'},\n            {\'key\': \'master_glide\', \'label\': \'GLIDE\', \'initial\': 0.0, \'format\': lambda v: f\'{int(v*100)}\'},\n            {\'key\': \'master_level\', \'label\': \'LEVEL\', \'initial\': 1.0, \'format\': lambda v: f\'{int(v*127)}\'}\n        ]:\n            self._create_knob_column(row, k)\n\n    def _create_knob_column(self, parent, knob_def):\n        f = tk.Frame(parent, bg=BG_BLACK)\n        f.pack(side=\'left\', expand=True, fill=\'x\')\n        disp = label(f, knob_def[\'format\'](knob_def[\'initial\']), size=9, color=FG_WHITE, bold=True)\n        disp.pack(pady=(0, 4))\n        knob = RotaryKnob(f, value=knob_def[\'initial\'], min_val=0.0, max_val=1.0,\n                         label=knob_def[\'label\'], size=52, format_fn=knob_def[\'format\'])\n        knob.pack()\n        label(f, knob_def[\'label\'], size=7, color=FG_DIM).pack(pady=(4, 0))\n\n    def _build_filter(self, parent):\n        sep(parent).pack(fill=\'x\')\n        sec = tk.Frame(parent, bg=BG_BLACK)\n        sec.pack(fill=\'x\', padx=12, pady=10)\n        label(sec, \'[FILTER]\', size=9, color=FG_WHITE, bold=True).pack(anchor=\'w\', pady=(0, 6))\n        \n        btn_row = tk.Frame(sec, bg=BG_BLACK)\n        btn_row.pack(fill=\'x\', pady=(0, 8))\n        for ft in [\'LP\', \'HP\', \'BP\', \'NT\']:\n            b = tk.Button(btn_row, text=ft, font=(FONT_MAIN, 8), relief=\'flat\', \n                         bg=BORDER, fg=FG_DIM, activebackground=BG_BLACK, \n                         activeforeground=FG_WHITE, cursor=\'hand2\', width=3)\n            b.pack(side=\'left\', padx=3)\n        \n        row = tk.Frame(sec, bg=BG_BLACK)\n        row.pack(fill=\'x\')\n        for k in [\n            {\'key\': \'filter_cutoff\', \'label\': \'CUTOFF\', \'initial\': 0.5, \'format\': lambda v: f\'{int(v*100)}\'},\n            {\'key\': \'filter_res\', \'label\': \'RES\', \'initial\': 0.3, \'format\': lambda v: f\'{int(v*100)}\'},\n            {\'key\': \'filter_drive\', \'label\': \'DRV\', \'initial\': 0.0, \'format\': lambda v: f\'{int(v*100)}\'}\n        ]:\n            self._create_knob_column(row, k)\n\n    def _build_effects(self, parent):\n        sep(parent).pack(fill=\'x\')\n        sec = tk.Frame(parent, bg=BG_BLACK)\n        sec.pack(fill=\'x\', padx=12, pady=10)\n        label(sec, \'[FX]\', size=9, color=FG_WHITE, bold=True).pack(anchor=\'w\', pady=(0, 6))\n        \n        for fx_name, params in [\n            (\'DISTORTION\', [{\'key\': \'fx_dist\', \'label\': \'AMT\', \'initial\': 0.0, \'format\': lambda v: f\'{int(v*100)}%\'}]),\n            (\'DELAY\', [\n                {\'key\': \'fx_delay_time\', \'label\': \'TIME\', \'initial\': 0.3, \'format\': lambda v: f\'{v:.2f}s\'},\n                {\'key\': \'fx_delay_fdbk\', \'label\': \'FDBK\', \'initial\': 0.4, \'format\': lambda v: f\'{int(v*100)}%\'},\n                {\'key\': \'fx_delay_mix\', \'label\': \'MIX\', \'initial\': 0.0, \'format\': lambda v: f\'{int(v*100)}%\'}\n            ]),\n            (\'REVERB\', [{\'key\': \'fx_reverb\', \'label\': \'AMT\', \'initial\': 0.0, \'format\': lambda v: f\'{int(v*100)}%\'}])\n        ]:\n            box = tk.Frame(sec, bg=BG_PANEL, bd=1, relief=\'solid\')\n            box.pack(fill=\'x\', pady=2)\n            label(tk.Frame(box, bg=BG_PANEL), fx_name, size=7).pack(side=\'left\', padx=5, pady=3)\n            row = tk.Frame(box, bg=BG_PANEL)\n            row.pack(fill=\'x\', padx=5, pady=(0, 4))\n            for k in params:\n                self._create_knob_column(row, k)\n\n    def _build_center(self, parent):\n        frame = tk.Frame(parent, bg=BG_BLACK)\n        frame.pack(side=\'left\', fill=\'both\', expand=True)\n        \n        hdr = tk.Frame(frame, bg=BG_BLACK, height=35)\n        hdr.pack(fill=\'x\')\n        hdr.pack_propagate(False)\n        sep(hdr).pack(side=\'bottom\', fill=\'x\')\n        label(hdr, \'VISUALIZER\', size=9, color=FG_WHITE, bold=True).pack(side=\'left\', padx=12, pady=8)\n        \n        content = tk.Frame(frame, bg=BG_BLACK)\n        content.pack(fill=\'both\', expand=True, padx=12, pady=12)\n        \n        self.display_canvas = tk.Canvas(content, bg=BG_BLACK, highlightthickness=1, highlightbackground=BORDER)\n        self.display_canvas.pack(fill=\'both\', expand=True)\n        \n        self._animate_wavetable()\n\n    def _animate_wavetable(self):\n        if not self.display_canvas:\n            return\n        w = self.display_canvas.winfo_width()\n        h = self.display_canvas.winfo_height()\n        \n        if w > 10 and h > 10:\n            self.display_canvas.delete(\'all\')\n            for x in range(0, w + 40, 40):\n                self.display_canvas.create_line(x, 0, x, h, fill=BORDER)\n            for y in range(0, h + 40, 40):\n                self.display_canvas.create_line(0, y, w, y, fill=BORDER)\n            self.display_canvas.create_line(0, h // 2, w, h // 2, fill=FG_DIM, width=1)\n            \n            audio = self.synth.last_buffer\n            pts = []\n            downsample = max(1, len(audio) // w)\n            for i in range(0, len(audio), downsample):\n                x = int((i / len(audio)) * w)\n                y = h // 2 - int(audio[i] * (h / 2.5))\n                pts.extend([x, y])\n            if len(pts) >= 4:\n                self.display_canvas.create_line(pts, fill=FG_WHITE, width=1, smooth=True)\n        \n        self.animation_id = self.root.after(33, self._animate_wavetable)\n\n    def _on_key_press(self, e):\n        key = e.keysym.lower()\n        if key == \'m\':\n            self._cycle_waveform(1)\n            return\n        elif key == \'n\':\n            self._cycle_waveform(-1)\n            return\n        if key in ALL_KEYS and key not in self._playing_notes:\n            midi_note = ALL_KEYS[key]\n            self._playing_notes[key] = midi_note\n            self.synth.note_on(midi_note)\n            if self.piano_keyboard:\n                self.piano_keyboard.highlight_key(midi_note, True)\n\n    def _on_key_release(self, e):\n        key = e.keysym.lower()\n        if key in self._playing_notes:\n            midi_note = self._playing_notes.pop(key)\n            self.synth.note_off(midi_note)\n            if self.piano_keyboard:\n                self.piano_keyboard.highlight_key(midi_note, False)\n\n    def _init_mini_waves(self):\n        for canvas, wtype, freq in self._wt_canvases:\n            canvas.delete(\'all\')\n            canvas.configure(bg=BG_BLACK)\n            w = canvas.winfo_width() or 280\n            h = canvas.winfo_height() or 50\n            for i in range(5):\n                canvas.create_line(0, int(h / 4 * i), w, int(h / 4 * i), fill=BORDER, width=1)\n            pts = []\n            for x in range(w):\n                t = (x / w) * math.pi * 2 * freq\n                if wtype == \'sine\':\n                    y = math.sin(t)\n                elif wtype == \'saw\':\n                    y = 2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1\n                elif wtype == \'square\':\n                    y = 1 if t % (math.pi * 2) < math.pi else -1\n                else:\n                    y = 2 * abs(2 * ((t % (math.pi * 2)) / (math.pi * 2)) - 1) - 1\n                pts.extend([x, h / 2 - y * h / 2.5])\n            if len(pts) >= 4:\n                canvas.create_line(pts, fill=FG_WHITE, width=1, smooth=True)\n\n\nif __name__ == \'__main__\':\n    root = tk.Tk()\n    try:\n        from ctypes import windll\n        windll.shcore.SetProcessDpiAwareness(1)\n    except Exception:\n        pass\n    app = SerumApp(root)\n    root.mainloop()\n'
 def run_embedded_osc() -> None:
-    """Embedded version of PAGE404MAX/noir-terminal testwavetable.py."""
     namespace = {"__name__": "__main__", "__file__": str(Path(__file__))}
     exec(EMBEDDED_OSC_CODE, namespace)
 
+
 def run_embedded_visualizer() -> None:
-    """Embedded version of PAGE404MAX/noir-terminal Visual."""
     try:
         import pygame
     except ImportError:
         try:
             import mygame as pygame
         except ImportError:
-            print("✗ Missing required module: pygame")
+            print("Missing required module: pygame")
             print("Install it with 'pip install pygame' and try again.")
             return
 
     if sd is None:
-        print("✗ Missing required module or audio backend: sounddevice")
+        print("Missing required module or audio backend: sounddevice")
         print("Install it with 'pip install sounddevice' and try again.")
         return
 
-    # =========================
-    # CONFIG
-    # =========================
     NATIVE_W, NATIVE_H = 600, 400
     SAMPLE_RATE = 44100
     BLOCK_SIZE = 2048
@@ -1584,12 +2160,11 @@ def run_embedded_visualizer() -> None:
     GHOST_FADE = 0.12
     FRAME_RADIUS = 20
 
-    # AUDIO DEVICE DETECTION
     print("Scanning for audio devices...")
     try:
         devices = sd.query_devices()
     except Exception as exc:
-        print(f"✗ Could not query audio devices: {exc}")
+        print(f"Could not query audio devices: {exc}")
         return
 
     AUDIO_DEVICE = None
@@ -1602,11 +2177,11 @@ def run_embedded_visualizer() -> None:
             name_lower = str(device.get("name", "")).lower()
             if any(keyword in name_lower for keyword in stereo_mix_keywords):
                 AUDIO_DEVICE = i
-                print(f"✓ Found: [{i}] {device['name']}")
+                print(f"Found: [{i}] {device['name']}")
                 break
 
     if AUDIO_DEVICE is None:
-        print("✗ No Stereo Mix detected!")
+        print("No Stereo Mix detected!")
         print("Using default input device...")
 
     pygame.init()
@@ -1623,40 +2198,29 @@ def run_embedded_visualizer() -> None:
 
     try:
         stream = sd.InputStream(
-            device=AUDIO_DEVICE,
-            callback=audio_callback,
-            blocksize=BLOCK_SIZE,
-            channels=2,
-            samplerate=SAMPLE_RATE,
+            device=AUDIO_DEVICE, callback=audio_callback,
+            blocksize=BLOCK_SIZE, channels=2, samplerate=SAMPLE_RATE,
         )
         stream.start()
-        print("✓ Audio initialized successfully")
+        print("Audio initialized successfully")
     except Exception as exc:
-        print(f"✗ Audio error: {exc}")
+        print(f"Audio error: {exc}")
         pygame.quit()
         return
 
     def catmull_rom(points, samples=8):
-        if len(points) < 4:
-            return points
+        if len(points) < 4: return points
         smoothed = []
         for i in range(1, len(points) - 2):
             p0, p1, p2, p3 = points[i - 1], points[i], points[i + 1], points[i + 2]
             for t in np.linspace(0, 1, samples, endpoint=False):
-                t2 = t * t
-                t3 = t2 * t
-                x = 0.5 * (
-                    (2 * p1[0])
-                    + (-p0[0] + p2[0]) * t
-                    + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
-                    + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
-                )
-                y = 0.5 * (
-                    (2 * p1[1])
-                    + (-p0[1] + p2[1]) * t
-                    + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
-                    + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
-                )
+                t2 = t * t; t3 = t2 * t
+                x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t +
+                          (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                          (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+                y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t +
+                          (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                          (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
                 smoothed.append((x, y))
         smoothed.append(points[-2])
         smoothed.append(points[-1])
@@ -1679,7 +2243,6 @@ def run_embedded_visualizer() -> None:
         glass = pygame.Surface((NATIVE_W, PANEL_HEIGHT), pygame.SRCALPHA)
         glass.fill((30, 30, 30, 160))
         surface.blit(glass, (0, 0))
-
         reflection = pygame.Surface((NATIVE_W, PANEL_HEIGHT // 2), pygame.SRCALPHA)
         for y in range(reflection.get_height()):
             alpha = int(80 * (1 - y / reflection.get_height()))
@@ -1690,8 +2253,7 @@ def run_embedded_visualizer() -> None:
     try:
         while running:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+                if event.type == pygame.QUIT: running = False
 
             blur_surface.fill((0, 0, 0, 40))
             visual_surface.blit(blur_surface, (0, 0))
@@ -1702,17 +2264,12 @@ def run_embedded_visualizer() -> None:
 
             if audio_level_boosted > 0.001:
                 max_val = np.max(np.abs(mono))
-                if max_val > 0:
-                    mono = mono / max_val
+                if max_val > 0: mono = mono / max_val
             else:
                 t = pygame.time.get_ticks() / 1000.0
                 mono = np.sin(np.linspace(0, 2 * np.pi, len(mono)) + t * 0.5) * 0.3
 
-            mono = np.interp(
-                np.linspace(0, len(mono), frame_rect.width),
-                np.arange(len(mono)),
-                mono,
-            )
+            mono = np.interp(np.linspace(0, len(mono), frame_rect.width), np.arange(len(mono)), mono)
 
             points = []
             mid_y = frame_rect.y + frame_rect.height / 2
@@ -1722,14 +2279,11 @@ def run_embedded_visualizer() -> None:
                 y = int(mid_y + sample * amp)
                 points.append((x, y))
 
-            if len(points) > 4:
-                points = catmull_rom(points, samples=4)
+            if len(points) > 4: points = catmull_rom(points, samples=4)
 
             ghost_trails.insert(0, points)
-            if len(ghost_trails) > GHOST_TRAIL_COUNT:
-                ghost_trails.pop()
-            if audio_level_boosted <= 0.001:
-                ghost_trails.clear()
+            if len(ghost_trails) > GHOST_TRAIL_COUNT: ghost_trails.pop()
+            if audio_level_boosted <= 0.001: ghost_trails.clear()
 
             wave_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
             for idx, trail in enumerate(ghost_trails):
@@ -1763,6 +2317,9 @@ def run_embedded_visualizer() -> None:
         except Exception:
             pass
 
+
+# ============================ MAIN ============================
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--nill-visualizer":
         run_embedded_visualizer()
@@ -1771,8 +2328,9 @@ def main() -> None:
         run_embedded_osc()
         return
 
-    print("Nill | Black & White Terminal Open Source DAW")
-    print("Features: pattern editor, FL-style piano roll, black/white terminal UI, ghost notes, scale highlighting, track rack.")
+    print("Nill | FL-Style Playlist DAW")
+    print("Features: pattern-based playlist, drag clips, resize, piano roll, smooth playback.")
+    print("Commands: set bpm ___, show osc, show visualizer")
     app = QApplication(sys.argv)
     window = Nill()
     window.show()
