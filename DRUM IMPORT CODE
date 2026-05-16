@@ -1,0 +1,360 @@
+import re
+
+with open('Nill Command Test', 'r', encoding='utf-8') as f:
+    src = f.read()
+
+# ===================================================================
+# 1. Insert audio loader + Sampler before ChiptuneSynth (Insert Drum Setting)
+# ===================================================================
+audio_block = '''# ============================ AUDIO / SAMPLER ============================
+
+def _load_wave_stdlib(path: str):
+    import wave
+    with wave.open(path, 'rb') as wf:
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        rate = wf.getframerate()
+        nframes = wf.getnframes()
+        raw = wf.readframes(nframes)
+        if width == 2:
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif width == 1:
+            data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+        elif width == 4:
+            data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported sample width: {width}")
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1)
+        return data, rate
+
+def _resample_audio(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return data
+    ratio = target_sr / orig_sr
+    n_samples = int(len(data) * ratio)
+    return np.interp(
+        np.linspace(0, len(data) - 1, n_samples),
+        np.arange(len(data)),
+        data
+    ).astype(np.float32)
+
+try:
+    import soundfile as sf
+    _HAS_SOUNDFILE = True
+except ImportError:
+    sf = None
+    _HAS_SOUNDFILE = False
+
+def load_audio_file(path: str, target_sr: int = 44100) -> Optional[np.ndarray]:
+    data = None
+    rate = target_sr
+    if _HAS_SOUNDFILE:
+        try:
+            data, rate = sf.read(path, dtype='float32')
+            if data.ndim > 1:
+                data = data.mean(axis=1)
+        except Exception:
+            data = None
+    if data is None and path.lower().endswith('.wav'):
+        try:
+            data, rate = _load_wave_stdlib(path)
+        except Exception:
+            data = None
+    if data is None:
+        return None
+    if rate != target_sr:
+        data = _resample_audio(data, rate, target_sr)
+    peak = np.max(np.abs(data))
+    if peak > 0:
+        data = data / peak * 0.8
+    return data.astype(np.float32)
+
+class SampleVoice:
+    def __init__(self, buffer: np.ndarray, velocity: float = 1.0):
+        self.buffer = buffer
+        self.pos = 0
+        self.velocity = float(velocity)
+
+class Sampler:
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        self.samples: List[np.ndarray] = []
+        self._voices: List[SampleVoice] = []
+        self._lock = threading.Lock()
+
+    def add_sample(self, path: str) -> bool:
+        data = load_audio_file(path, self.sample_rate)
+        if data is None:
+            return False
+        self.samples.append(data)
+        return True
+
+    def clear_samples(self):
+        with self._lock:
+            self.samples.clear()
+            self._voices.clear()
+
+    def trigger(self, sample_index: int, velocity: float = 1.0):
+        with self._lock:
+            if 0 <= sample_index < len(self.samples):
+                self._voices.append(SampleVoice(self.samples[sample_index], velocity))
+
+    def generate_audio(self, frames: int) -> np.ndarray:
+        out = np.zeros(frames, dtype=np.float32)
+        with self._lock:
+            dead: List[int] = []
+            for i, voice in enumerate(self._voices):
+                remaining = len(voice.buffer) - voice.pos
+                if remaining <= 0:
+                    dead.append(i)
+                    continue
+                to_copy = min(frames, remaining)
+                out[:to_copy] += voice.buffer[voice.pos:voice.pos + to_copy] * voice.velocity
+                voice.pos += to_copy
+                if voice.pos >= len(voice.buffer):
+                    dead.append(i)
+            for i in reversed(dead):
+                self._voices.pop(i)
+        return out
+
+# ============================ SYNTH ENGINE ============================
+'''
+
+src = src.replace('# ============================ SYNTH ENGINE ============================', audio_block)
+
+# ===================================================================
+# 2. Add self.samplers dict in Nill.__init__
+# ===================================================================
+src = src.replace(
+    '        self.current_theme_name = "Terminal"\n        self.theme = THEMES["Terminal"]\n\n        self.synth  = ChiptuneSynth()',
+    '        self.current_theme_name = "Terminal"\n        self.theme = THEMES["Terminal"]\n\n        self.samplers: Dict[int, Sampler] = {}\n\n        self.synth  = ChiptuneSynth()'
+)
+
+# ===================================================================
+# 3. Modify _collect_active_notes to return pattern_index
+# ===================================================================
+src = src.replace(
+    '                        active[key] = (pat, note)',
+    '                        active[key] = (clip.pattern_index, pat, note)'
+)
+
+# ===================================================================
+# 4. Modify update_playback – sampler triggers + synth
+# ===================================================================
+old_playback = '''        for key in self._last_active_keys - active_keys:
+            self.synth.note_off(key)
+        for key in active_keys - self._last_active_keys:
+            pat, note = active[key]
+            self.synth.note_on(
+                key=key, pitch=note.pitch,
+                velocity=max(0.0, min(1.0, note.velocity / 127.0)),
+                waveform=pat.waveform, gain=pat.gain,
+            )'''
+
+new_playback = '''        for key in self._last_active_keys - active_keys:
+            self.synth.note_off(key)
+        for key in active_keys - self._last_active_keys:
+            pat_idx, pat, note = active[key]
+            if pat_idx in self.samplers:
+                sampler = self.samplers[pat_idx]
+                sample_idx = note.pitch - 36
+                if 0 <= sample_idx < len(sampler.samples):
+                    sampler.trigger(sample_idx, max(0.0, min(1.0, note.velocity / 127.0)))
+            else:
+                self.synth.note_on(
+                    key=key, pitch=note.pitch,
+                    velocity=max(0.0, min(1.0, note.velocity / 127.0)),
+                    waveform=pat.waveform, gain=pat.gain,
+                )'''
+
+src = src.replace(old_playback, new_playback)
+
+# ===================================================================
+# 5. Modify audio_callback to mix sampler output
+# ===================================================================
+old_callback = '''    def audio_callback(self, outdata, frames, time_info, status) -> None:
+        if status: print(status)
+        audio = self.synth.generate_audio(frames)
+        outdata[:, 0] = np.clip(audio, -0.97, 0.97)'''
+
+new_callback = '''    def audio_callback(self, outdata, frames, time_info, status) -> None:
+        if status: print(status)
+        synth_audio = self.synth.generate_audio(frames)
+        sampler_audio = np.zeros(frames, dtype=np.float32)
+        for sampler in list(self.samplers.values()):
+            sampler_audio += sampler.generate_audio(frames)
+        mixed = synth_audio + sampler_audio
+        outdata[:, 0] = np.clip(mixed, -0.97, 0.97)'''
+
+src = src.replace(old_callback, new_callback)
+
+# ===================================================================
+# 6. Replace import_drums + add show_drum_machine
+# ===================================================================
+# Use regex to grab the whole method
+import_drums_re = r'(    def import_drums\(self, zip_path: str\) -> None:.*?)(?=\n    def import_midi\(self, path: str\) -> None:)'
+
+new_import_block = '''    def import_drums(self, zip_path: str) -> None:
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                audio_files = sorted([
+                    n for n in zf.namelist()
+                    if n.lower().endswith(('.wav', '.mp3', '.ogg', '.flac'))
+                ])
+                if not audio_files:
+                    QMessageBox.warning(self, "Import Drums", "No audio files found in the ZIP.")
+                    return
+                temp_dir = tempfile.mkdtemp(prefix="nill_drums_")
+                for name in audio_files:
+                    zf.extract(name, temp_dir)
+                extracted_paths = [str(Path(temp_dir) / name) for name in audio_files]
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Drums Failed", str(exc))
+            return
+
+        kit_name = Path(zip_path).stem
+        pat_idx = len(self.patterns)
+        pat = Pattern(
+            name=f"Kit: {kit_name}",
+            color=PATTERN_COLORS[pat_idx % len(PATTERN_COLORS)],
+            waveform="noise",
+            length_beats=4.0,
+        )
+        for beat in range(4):
+            pat.notes.append(Note(pitch=36, start=float(beat), duration=0.5, velocity=100))
+
+        self.patterns.append(pat)
+
+        sampler = Sampler(self.synth.sample_rate)
+        loaded = 0
+        for path in extracted_paths[:16]:
+            if sampler.add_sample(path):
+                loaded += 1
+        if loaded > 0:
+            self.samplers[pat_idx] = sampler
+
+        track_idx = len(self.playlist_tracks)
+        track_color = PATTERN_COLORS[track_idx % len(PATTERN_COLORS)]
+        self.playlist_tracks.append(PlaylistTrack(name=f"Drum {track_idx+1}", color=track_color))
+        self.playlist_tracks[-1].clips.append(PlaylistClip(
+            pattern_index=pat_idx,
+            track_index=track_idx,
+            start_beat=0.0,
+            duration_beats=pat.length_beats,
+        ))
+
+        self.refresh_pattern_buttons()
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+        self.piano_roll.update()
+
+        if pat_idx in self.samplers:
+            self.show_drum_machine(pat_idx)
+        else:
+            QMessageBox.warning(self, "Import Drums", "Found audio files but could not load any. Install 'soundfile' (pip install soundfile) for MP3/OGG/FLAC support.")
+
+    def show_drum_machine(self, pattern_index: int) -> None:
+        dlg = DrumMachineDialog(self, pattern_index)
+        dlg.exec()
+
+'''
+
+src = re.sub(import_drums_re, new_import_block, src, flags=re.DOTALL)
+
+# ===================================================================
+# 7. Insert DrumMachineDialog before SettingsDialog
+# ===================================================================
+drum_machine_class = '''class DrumMachineDialog(QDialog):
+    PAD_LABELS = ["C1", "C#1", "D1", "D#1", "E1", "F1", "F#1", "G1", "G#1", "A1", "A#1", "B1", "C2", "C#2", "D2", "D#2"]
+
+    def __init__(self, parent: "Nill", pattern_index: int) -> None:
+        super().__init__(parent)
+        self.daw = parent
+        self.pattern_index = pattern_index
+        self.setWindowTitle(f"Drum Machine – {self.daw.patterns[pattern_index].name}")
+        self.setMinimumSize(520, 400)
+        self.pads: List[QPushButton] = []
+        self.build_ui()
+        self.apply_theme_style()
+        self.refresh_pads()
+
+    def build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel(f"◈ {self.daw.patterns[self.pattern_index].name}")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #FFF;")
+        layout.addWidget(title)
+
+        grid = QWidget()
+        grid_layout = QGridLayout(grid)
+        grid_layout.setSpacing(8)
+        for i in range(16):
+            btn = QPushButton()
+            btn.setFixedSize(100, 80)
+            btn.setProperty("pad_index", i)
+            btn.clicked.connect(lambda checked=False, idx=i: self.trigger_pad(idx))
+            grid_layout.addWidget(btn, i // 4, i % 4)
+            self.pads.append(btn)
+
+        layout.addWidget(grid)
+
+        info = QLabel("Pads map to MIDI notes C1–D#2 (36–51). Use the Piano Roll to sequence them.")
+        info.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(info)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def refresh_pads(self) -> None:
+        sampler = self.daw.samplers.get(self.pattern_index)
+        for i, btn in enumerate(self.pads):
+            label = self.PAD_LABELS[i]
+            if sampler and i < len(sampler.samples):
+                btn.setText(f"{label}\\nSample {i+1}")
+                btn.setEnabled(True)
+            else:
+                btn.setText(f"{label}\\n—")
+                btn.setEnabled(False)
+
+    def trigger_pad(self, idx: int) -> None:
+        sampler = self.daw.samplers.get(self.pattern_index)
+        if sampler and idx < len(sampler.samples):
+            sampler.trigger(idx, 0.9)
+
+    def apply_theme_style(self) -> None:
+        t = self.daw.theme
+        self.setStyleSheet(f"""
+            QDialog {{ background: {t['bg_main']}; color: {t['text_main']}; border: 1px solid {t['border']}; }}
+            QLabel {{ color: {t['text_main']}; padding: 2px; }}
+            QPushButton {{ background: {t['button_bg']}; border: 1px solid {t['button_border']}; color: {t['text_main']}; padding: 6px; border-radius: 4px; }}
+            QPushButton:hover {{ background: {t['button_hover']}; }}
+            QPushButton:disabled {{ background: {t['bg_muted']}; color: {t['text_dim']}; border: 1px solid {t['grid_sub']}; }}
+        """)
+
+    def keyPressEvent(self, event) -> None:
+        key_map = {
+            Qt.Key.Key_Z: 0, Qt.Key.Key_X: 1, Qt.Key.Key_C: 2, Qt.Key.Key_V: 3,
+            Qt.Key.Key_A: 4, Qt.Key.Key_S: 5, Qt.Key.Key_D: 6, Qt.Key.Key_F: 7,
+            Qt.Key.Key_Q: 8, Qt.Key.Key_W: 9, Qt.Key.Key_E: 10, Qt.Key.Key_R: 11,
+            Qt.Key.Key_1: 12, Qt.Key.Key_2: 13, Qt.Key.Key_3: 14, Qt.Key.Key_4: 15,
+        }
+        idx = key_map.get(event.key())
+        if idx is not None:
+            self.trigger_pad(idx)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+'''
+
+src = src.replace('# ============================ SETTINGS DIALOG ============================',
+                  drum_machine_class + '# ============================ SETTINGS DIALOG ============================')
+
+with open('Nill Command Test', 'w', encoding='utf-8') as f:
+    f.write(src)
+
+print("Drum machine patch applied successfully")
