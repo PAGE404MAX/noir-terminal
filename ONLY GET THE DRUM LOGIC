@@ -1,0 +1,2842 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import math
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+import zipfile
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, Hashable, List, Optional, Tuple
+
+import numpy as np
+
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
+
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+
+from PySide6.QtCore import Qt, QEvent, QTimer, QRectF, Signal, QSize, QPoint
+from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen, QBrush, QPolygon
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QMenu,
+    QPushButton, QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+)
+
+# ============================ CONSTANTS ============================
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+PATTERN_COLORS = [
+    "#E6E6E6", "#CFCFCF", "#B8B8B8", "#FFFFFF",
+    "#8A8A8A", "#737373", "#5C5C5C", "#444444",
+    "#AAAAAA", "#666666", "#999999", "#CCCCCC",
+]
+
+# ============================ DATA MODELS ============================
+
+@dataclass
+class Note:
+    pitch: int
+    start: float
+    duration: float
+    velocity: int = 100
+    muted: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "Note":
+        return Note(
+            pitch=int(data.get("pitch", 60)),
+            start=float(data.get("start", 0.0)),
+            duration=float(data.get("duration", 1.0)),
+            velocity=int(data.get("velocity", 100)),
+            muted=bool(data.get("muted", False)),
+        )
+
+@dataclass
+class Pattern:
+    name: str
+    color: str
+    length_beats: float = 4.0
+    waveform: str = "square"
+    gain: float = 0.70
+    notes: List[Note] = field(default_factory=list)
+    mode: str = "synth"
+    step_count: int = 16
+    step_duration: str = "1/16"
+    swing: float = 0.0
+    drum_samples: List[str] = field(default_factory=list)
+    drum_grid: List[List[int]] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "color": self.color,
+            "length_beats": self.length_beats,
+            "waveform": self.waveform,
+            "gain": self.gain,
+            "notes": [n.to_dict() for n in self.notes],
+            "mode": self.mode,
+            "step_count": self.step_count,
+            "step_duration": self.step_duration,
+            "swing": self.swing,
+            "drum_samples": list(self.drum_samples),
+            "drum_grid": [list(row) for row in self.drum_grid],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Pattern":
+        return Pattern(
+            name=str(data.get("name", "Pattern")),
+            color=str(data.get("color", "#E6E6E6")),
+            length_beats=float(data.get("length_beats", 4.0)),
+            waveform=str(data.get("waveform", "square")),
+            gain=float(data.get("gain", 0.70)),
+            notes=[Note.from_dict(n) for n in data.get("notes", [])],
+            mode=str(data.get("mode", "drums" if data.get("drum_grid") or data.get("drum_samples") else "synth")),
+            step_count=int(data.get("step_count", 16)),
+            step_duration=str(data.get("step_duration", "1/16")),
+            swing=float(data.get("swing", 0.0)),
+            drum_samples=[str(p) for p in data.get("drum_samples", [])],
+            drum_grid=[[int(v) for v in row] for row in data.get("drum_grid", [])],
+        )
+
+@dataclass
+class PlaylistClip:
+    pattern_index: int
+    track_index: int
+    start_beat: float
+    duration_beats: float
+    muted: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: dict) -> "PlaylistClip":
+        return PlaylistClip(
+            pattern_index=int(data.get("pattern_index", 0)),
+            track_index=int(data.get("track_index", 0)),
+            start_beat=float(data.get("start_beat", 0.0)),
+            duration_beats=float(data.get("duration_beats", 4.0)),
+            muted=bool(data.get("muted", False)),
+        )
+
+@dataclass
+class PlaylistTrack:
+    name: str
+    color: str
+    muted: bool = False
+    solo: bool = False
+    track_type: str = "synth"
+    clips: List[PlaylistClip] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "color": self.color,
+            "muted": self.muted,
+            "solo": self.solo,
+            "track_type": self.track_type,
+            "clips": [c.to_dict() for c in self.clips],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "PlaylistTrack":
+        return PlaylistTrack(
+            name=str(data.get("name", "Track")),
+            color=str(data.get("color", "#E6E6E6")),
+            muted=bool(data.get("muted", False)),
+            solo=bool(data.get("solo", False)),
+            track_type=str(data.get("track_type", "synth")),
+            clips=[PlaylistClip.from_dict(c) for c in data.get("clips", [])],
+        )
+
+# ============================ SYNTH ENGINE ============================
+
+class ChiptuneSynth:
+    def __init__(self, sample_rate: int = 44100, buffer_size: int = 512) -> None:
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
+        self._voices: Dict[Hashable, dict] = {}
+        self._lock = threading.Lock()
+        self.master_gain = 0.22
+
+    @staticmethod
+    def midi_to_freq(pitch: int) -> float:
+        return 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+
+    def note_on(self, key: Hashable, pitch: int, velocity: float = 1.0,
+                waveform: str = "square", gain: float = 0.6) -> None:
+        with self._lock:
+            self._voices[key] = {
+                "pitch": pitch, "freq": self.midi_to_freq(pitch), "phase": 0.0,
+                "velocity": float(max(0.0, min(1.0, velocity))),
+                "waveform": waveform, "gain": float(max(0.0, min(1.25, gain))),
+                "env": 0.0, "state": "attack",
+            }
+
+    def note_off(self, key: Hashable) -> None:
+        with self._lock:
+            voice = self._voices.get(key)
+            if voice and voice["state"] != "release":
+                voice["state"] = "release"
+
+    def all_notes_off(self) -> None:
+        with self._lock:
+            for voice in self._voices.values():
+                if voice["state"] != "release":
+                    voice["state"] = "release"
+
+    def _wave(self, waveform: str, phases: np.ndarray) -> np.ndarray:
+        if waveform == "square":
+            return np.where(np.sin(phases) >= 0.0, 1.0, -1.0).astype(np.float32)
+        if waveform == "triangle":
+            return ((2.0 / np.pi) * np.arcsin(np.sin(phases))).astype(np.float32)
+        if waveform == "saw":
+            return (((phases / np.pi) % 2.0) - 1.0).astype(np.float32)
+        if waveform == "noise":
+            return np.random.uniform(-1.0, 1.0, len(phases)).astype(np.float32)
+        return np.sin(phases).astype(np.float32)
+
+    def generate_audio(self, frames: int) -> np.ndarray:
+        out = np.zeros(frames, dtype=np.float32)
+        sr = self.sample_rate
+        dt = 1.0 / sr
+        attack_step  = 1.0 / max(1, int(0.003 * sr))
+        decay_step   = (1.0 - 0.65) / max(1, int(0.07 * sr))
+        release_step = 1.0 / max(1, int(0.14 * sr))
+
+        with self._lock:
+            dead_keys: List[Hashable] = []
+            for key, voice in list(self._voices.items()):
+                phase     = float(voice["phase"])
+                freq      = float(voice["freq"])
+                phase_inc = 2.0 * np.pi * freq * dt
+                idx       = np.arange(frames)
+                phases    = (phase + phase_inc * idx) % (2.0 * np.pi)
+                wave      = self._wave(str(voice["waveform"]), phases)
+                env       = float(voice["env"])
+                state     = str(voice["state"])
+                env_values = np.zeros(frames, dtype=np.float32)
+                for i in range(frames):
+                    if state == "attack":
+                        env += attack_step
+                        if env >= 1.0: env = 1.0; state = "decay"
+                    elif state == "decay":
+                        env -= decay_step
+                        if env <= 0.65: env = 0.65; state = "sustain"
+                    elif state == "sustain":
+                        env = 0.65
+                    elif state == "release":
+                        env -= release_step
+                        if env <= 0.0: env = 0.0; state = "dead"
+                    env_values[i] = env
+                voice["env"]   = env
+                voice["state"] = state
+                voice["phase"] = float((phase + phase_inc * frames) % (2.0 * np.pi))
+                out += wave * env_values * float(voice["velocity"]) * float(voice["gain"])
+                if state == "dead" or env <= 0.0001:
+                    dead_keys.append(key)
+            for key in dead_keys:
+                self._voices.pop(key, None)
+
+        out = np.tanh(out * (self.master_gain * 2.4))
+        return out.astype(np.float32)
+
+# ============================ PLAYLIST VIEW ============================
+
+class PlaylistView(QWidget):
+    pattern_double_clicked = Signal(int)
+
+    TRACK_HEIGHT   = 42
+    TRACK_HEADER_W = 110
+    BEAT_W_BASE    = 36.0
+    HEADER_H       = 26   # ruler height — loop handles live here
+    MIN_BEATS      = 128
+
+    # Pixel tolerance for grabbing loop handles on the ruler
+    HANDLE_HIT = 7
+
+    def __init__(self, daw: "Nill") -> None:
+        super().__init__()
+        self.daw = daw
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # clip interaction state
+        self.selected_clip: Optional[Tuple[int, int]] = None
+        self.drag_mode:     Optional[str]             = None
+        self.drag_start_x          = 0.0
+        self.drag_clip_start_beat  = 0.0
+        self.drag_clip_duration    = 4.0
+        self.drag_clip_track       = 0
+        self.hover_clip: Optional[Tuple[int, int]] = None
+        self.zoom_x = 1.0
+
+        # clip cache
+        self._clip_cache: List[Tuple[int, int, PlaylistClip]] = []
+        self._cache_valid = False
+
+        # paint-drag state (left-click on empty)
+        self._loop_paint_clip:   Optional[PlaylistClip] = None
+        self._loop_paint_track:  Optional[int]          = None
+        self._loop_paint_start_x: float                 = 0.0
+        self._paint_drag_track:       Optional[int]  = None
+        self._paint_drag_pat_idx:     Optional[int]  = None
+        self._paint_drag_painted_beats: set           = set()
+
+        # loop-region drag state
+        self._loop_drag: Optional[str] = None   # "start" | "end" | None
+
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAutoFillBackground(False)
+
+    # ------------------------------------------------------------------
+    # Coordinate helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def BEAT_W(self) -> float:
+        return self.BEAT_W_BASE * self.zoom_x
+
+    def beat_to_x(self, beat: float) -> float:
+        return self.TRACK_HEADER_W + beat * self.BEAT_W
+
+    def x_to_beat(self, x: float) -> float:
+        return max(0.0, (x - self.TRACK_HEADER_W) / self.BEAT_W)
+
+    def total_beats(self) -> float:
+        max_beat = self.MIN_BEATS
+        for track in self.daw.playlist_tracks:
+            for clip in track.clips:
+                max_beat = max(max_beat, clip.start_beat + clip.duration_beats + 16)
+        return max_beat
+
+    # ------------------------------------------------------------------
+    # Clip cache
+    # ------------------------------------------------------------------
+
+    def _invalidate_cache(self) -> None:
+        self._cache_valid = False
+
+    def _build_cache(self) -> None:
+        if self._cache_valid:
+            return
+        self._clip_cache = []
+        for t_idx, track in enumerate(self.daw.playlist_tracks):
+            for c_idx, clip in enumerate(track.clips):
+                self._clip_cache.append((t_idx, c_idx, clip))
+        self._clip_cache.sort(key=lambda x: x[2].start_beat)
+        self._cache_valid = True
+
+    def find_clip_at(self, x: float, y: float) -> Optional[Tuple[int, int, PlaylistClip]]:
+        if y < self.HEADER_H or x < self.TRACK_HEADER_W:
+            return None
+        track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+        if track_idx < 0 or track_idx >= len(self.daw.playlist_tracks):
+            return None
+        beat = self.x_to_beat(x)
+        for c_idx, clip in enumerate(self.daw.playlist_tracks[track_idx].clips):
+            if clip.start_beat <= beat < clip.start_beat + clip.duration_beats:
+                return (track_idx, c_idx, clip)
+        return None
+
+    def clip_rect(self, track_idx: int, clip: PlaylistClip) -> QRectF:
+        x = self.beat_to_x(clip.start_beat)
+        y = self.HEADER_H + track_idx * self.TRACK_HEIGHT + 2
+        w = max(4.0, clip.duration_beats * self.BEAT_W)
+        h = self.TRACK_HEIGHT - 4
+        return QRectF(x, y, w, h)
+
+    def sizeHint(self) -> QSize:
+        w = int(self.TRACK_HEADER_W + self.total_beats() * self.BEAT_W) + 100
+        h = self.HEADER_H + max(8, len(self.daw.playlist_tracks)) * self.TRACK_HEIGHT + 20
+        return QSize(w, h)
+
+    # ------------------------------------------------------------------
+    # Loop-handle hit testing (ruler bar only)
+    # ------------------------------------------------------------------
+
+    def _loop_handle_hit(self, x: float, y: float) -> Optional[str]:
+        """Return 'start', 'end', or None depending on which loop handle x/y hits."""
+        if y > self.HEADER_H:
+            return None
+        lx_start = self.beat_to_x(self.daw.loop_start)
+        lx_end   = self.beat_to_x(self.daw.loop_end)
+        if abs(x - lx_end) <= self.HANDLE_HIT:
+            return "end"
+        if abs(x - lx_start) <= self.HANDLE_HIT:
+            return "start"
+        return None
+
+    # ------------------------------------------------------------------
+    # Mini note-preview inside clip block
+    # ------------------------------------------------------------------
+
+    def _draw_note_preview(self, painter: QPainter, rect: QRectF,
+                           clip: PlaylistClip) -> None:
+        pattern = self.daw.patterns[clip.pattern_index]
+        notes   = [n for n in pattern.notes if not n.muted]
+        if not notes:
+            return
+
+        pat_len  = max(pattern.length_beats, 0.001)
+        clip_dur = max(clip.duration_beats, 0.001)
+
+        label_h = 12
+        inner   = rect.adjusted(2, label_h, -2, -2)
+        if inner.width() < 4 or inner.height() < 4:
+            return
+
+        pitches = [n.pitch for n in notes]
+        p_min   = min(pitches)
+        p_max   = max(pitches)
+        p_range = max(p_max - p_min, 1)
+
+        painter.fillRect(inner, QColor(0, 0, 0, 60))
+
+        num_loops       = int(clip_dur / pat_len)
+        note_color      = QColor(0, 0, 0, 180)
+        loop_line_color = QColor(0, 0, 0, 90)
+
+        # Loop boundary dashes
+        for loop_i in range(num_loops + 1):
+            lx_beat = loop_i * pat_len
+            if lx_beat >= clip_dur:
+                break
+            lx = inner.left() + (lx_beat / clip_dur) * inner.width()
+            if loop_i > 0:
+                painter.setPen(QPen(loop_line_color, 1, Qt.PenStyle.DashLine))
+                painter.drawLine(int(lx), int(inner.top()), int(lx), int(inner.bottom()))
+
+        # Note bars
+        painter.setPen(Qt.PenStyle.NoPen)
+        note_h = max(1.5, inner.height() / max(p_range + 1, 8))
+        for loop_i in range(num_loops + 1):
+            loop_offset = loop_i * pat_len
+            for note in notes:
+                ns = loop_offset + note.start
+                ne = loop_offset + note.start + note.duration
+                if ns >= clip_dur:
+                    break
+                ne = min(ne, clip_dur)
+                nx = inner.left() + (ns / clip_dur) * inner.width()
+                nw = max(1.5, (ne - ns) / clip_dur * inner.width())
+                ny = inner.bottom() - ((note.pitch - p_min) / p_range) * inner.height() - note_h
+                painter.setBrush(QBrush(note_color))
+                painter.drawRect(QRectF(nx, ny, nw, note_h))
+
+    # ------------------------------------------------------------------
+    # Paint
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+
+        total_beats = self.total_beats()
+        num_tracks  = len(self.daw.playlist_tracks)
+
+        # ---- Ruler background ----
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
+        painter.fillRect(0, 0, self.TRACK_HEADER_W, self.height(), QColor("#0A0A0A"))
+
+        # ---- Loop region shading on ruler ----
+        if self.daw.loop_enabled:
+            lx1 = self.beat_to_x(self.daw.loop_start)
+            lx2 = self.beat_to_x(self.daw.loop_end)
+            loop_fill = QColor(80, 160, 255, 38)
+            painter.fillRect(QRectF(lx1, 0, lx2 - lx1, self.HEADER_H), loop_fill)
+
+        # ---- Bar grid + numbers ----
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        for beat in range(int(total_beats) + 1):
+            x      = self.beat_to_x(beat)
+            is_bar = beat % 4 == 0
+            color  = QColor("#666") if is_bar else QColor("#333")
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
+            if is_bar and beat < total_beats:
+                painter.setPen(QColor("#AAA"))
+                painter.drawText(int(x + 4), 18, str(beat // 4 + 1))
+
+        # ---- Loop handles on ruler ----
+        # Draw a thin line + triangle handle for start and end
+        for handle_beat, color_hex, side in [
+            (self.daw.loop_start, "#4AF", "start"),
+            (self.daw.loop_end,   "#F84", "end"),
+        ]:
+            hx    = int(self.beat_to_x(handle_beat))
+            hcol  = QColor(color_hex)
+            hcol2 = QColor(color_hex)
+            hcol2.setAlpha(180)
+            painter.setPen(QPen(hcol, 2))
+            painter.drawLine(hx, 0, hx, self.HEADER_H)
+            # Small filled triangle at top of ruler
+            painter.setBrush(QBrush(hcol))
+            painter.setPen(Qt.PenStyle.NoPen)
+            if side == "start":
+                tri = QPolygon([QPoint(hx, 4), QPoint(hx + 10, 4), QPoint(hx, self.HEADER_H - 2)])
+            else:
+                tri = QPolygon([QPoint(hx, 4), QPoint(hx - 10, 4), QPoint(hx, self.HEADER_H - 2)])
+            painter.drawPolygon(tri)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        # ---- Track rows ----
+        for t_idx in range(num_tracks):
+            y     = self.HEADER_H + t_idx * self.TRACK_HEIGHT
+            track = self.daw.playlist_tracks[t_idx]
+            bg    = QColor("#111") if t_idx % 2 == 0 else QColor("#151515")
+            if track.muted:
+                bg = QColor("#080808")
+            painter.fillRect(self.TRACK_HEADER_W, y,
+                             int(self.beat_to_x(total_beats) - self.TRACK_HEADER_W),
+                             self.TRACK_HEIGHT, bg)
+
+            header_bg = QColor(track.color) if not track.muted else QColor("#222")
+            painter.fillRect(0, y, self.TRACK_HEADER_W, self.TRACK_HEIGHT, header_bg.darker(170))
+            painter.setPen(QPen(QColor(track.color if not track.muted else "#444"), 1))
+            painter.drawRect(0, y, self.TRACK_HEADER_W - 1, self.TRACK_HEIGHT - 1)
+            painter.setPen(QColor("#FFF" if not track.muted else "#555"))
+            painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+            painter.drawText(6, y + 16, track.name[:12])
+            painter.setFont(QFont("Consolas", 7))
+            if track.muted:
+                painter.setPen(QColor("#F44"))
+                painter.drawText(6, y + 30, "MUTED")
+            elif track.solo:
+                painter.setPen(QColor("#FC0"))
+                painter.drawText(6, y + 30, "SOLO")
+
+        # ---- Clips ----
+        for t_idx, track in enumerate(self.daw.playlist_tracks):
+            for c_idx, clip in enumerate(track.clips):
+                if clip.muted:
+                    continue
+                rect    = self.clip_rect(t_idx, clip)
+                if not rect.intersects(event.rect()):
+                    continue
+                pattern = self.daw.patterns[clip.pattern_index]
+                fill    = QColor(pattern.color)
+                if track.muted:
+                    fill = QColor("#222")
+                border = QColor("#DDD")
+                if self.selected_clip == (t_idx, c_idx):
+                    fill   = fill.lighter(125)
+                    border = QColor("#FFF")
+                painter.fillRect(rect, fill)
+
+                # Note minimap
+                self._draw_note_preview(painter, rect, clip)
+
+                # Loop-repeat separator lines
+                pat_len  = max(pattern.length_beats, 0.001)
+                clip_dur = max(clip.duration_beats, 0.001)
+                if clip_dur > pat_len:
+                    num_loops = int(clip_dur / pat_len)
+                    for li in range(1, num_loops + 1):
+                        sep_beat = clip.start_beat + li * pat_len
+                        if sep_beat >= clip.start_beat + clip_dur:
+                            break
+                        sx = self.beat_to_x(sep_beat)
+                        painter.setPen(QPen(QColor(0, 0, 0, 100), 1))
+                        painter.drawLine(int(sx), int(rect.top() + 2),
+                                         int(sx), int(rect.bottom() - 2))
+
+                painter.setPen(QPen(border, 1))
+                painter.drawRect(rect.adjusted(0, 0, -1, -1))
+                painter.setPen(QColor("#0A0A0A"))
+                painter.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+                txt = pattern.name[:max(3, int(rect.width() / 6))]
+                painter.drawText(rect.adjusted(4, 3, -4, 0),
+                                 Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, txt)
+                if rect.width() > 16:
+                    painter.setPen(QPen(QColor("#000"), 1, Qt.PenStyle.DotLine))
+                    painter.drawLine(int(rect.left() + 3), int(rect.top() + 5),
+                                     int(rect.left() + 3), int(rect.bottom() - 5))
+                    painter.drawLine(int(rect.right() - 4), int(rect.top() + 5),
+                                     int(rect.right() - 4), int(rect.bottom() - 5))
+
+        # ---- Playhead ----
+        px = self.beat_to_x(self.daw.playhead_song_beat)
+        painter.setPen(QPen(QColor("#FFF"), 2))
+        painter.drawLine(int(px), self.HEADER_H, int(px), self.height())
+        painter.setBrush(QBrush(QColor("#FFF")))
+        tri = QPolygon([QPoint(int(px), self.HEADER_H),
+                        QPoint(int(px - 5), self.HEADER_H - 7),
+                        QPoint(int(px + 5), self.HEADER_H - 7)])
+        painter.drawPolygon(tri)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#333"), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+    # ------------------------------------------------------------------
+    # Mouse events
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:
+        self.setFocus()
+        x = event.position().x()
+        y = event.position().y()
+
+        # ---- Track-header area ----
+        if x < self.TRACK_HEADER_W and y >= self.HEADER_H:
+            track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+            if 0 <= track_idx < len(self.daw.playlist_tracks):
+                if event.button() == Qt.MouseButton.RightButton:
+                    self.daw.show_track_context_menu(track_idx, event.globalPosition().toPoint())
+                else:
+                    self.daw.select_track(track_idx)
+            return
+
+        # ---- Ruler (header) area — loop handles + playhead seek ----
+        if y < self.HEADER_H:
+            if event.button() == Qt.MouseButton.LeftButton:
+                hit = self._loop_handle_hit(x, y)
+                if hit:
+                    # Grab a loop handle
+                    self._loop_drag = hit
+                    self.drag_mode  = "loop_handle"
+                else:
+                    # Seek playhead
+                    self.daw.playhead_song_beat = max(0.0, self.x_to_beat(x))
+                    self.update()
+            return
+
+        result = self.find_clip_at(x, y)
+
+        # ---- Right-click: delete clip OR paint + loop-extend ----
+        if event.button() == Qt.MouseButton.RightButton:
+            if result:
+                t_idx, c_idx, _ = result
+                self.daw.playlist_tracks[t_idx].clips.pop(c_idx)
+                self.selected_clip = None
+                self._invalidate_cache()
+                self.update()
+            else:
+                track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+                if 0 <= track_idx < len(self.daw.playlist_tracks):
+                    self.daw.select_track(track_idx)
+                    beat    = round(self.x_to_beat(x) * 4) / 4
+                    pat_idx = self.daw.selected_pattern_index
+                    pat     = self.daw.patterns[pat_idx]
+                    new_clip = PlaylistClip(
+                        pattern_index=pat_idx, track_index=track_idx,
+                        start_beat=beat, duration_beats=pat.length_beats,
+                    )
+                    self.daw.playlist_tracks[track_idx].clips.append(new_clip)
+                    self.daw.playlist_tracks[track_idx].clips.sort(key=lambda c: c.start_beat)
+                    self._invalidate_cache()
+                    self._loop_paint_clip    = new_clip
+                    self._loop_paint_track   = track_idx
+                    self._loop_paint_start_x = x
+                    self.update()
+            return
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # ---- Left-click on existing clip: move / resize ----
+        if result:
+            t_idx, c_idx, clip = result
+            self.daw.select_track(t_idx)
+            self.selected_clip = (t_idx, c_idx)
+            rect = self.clip_rect(t_idx, clip)
+            if abs(x - rect.left()) <= 6:
+                self.drag_mode = "resize_left"
+            elif abs(x - rect.right()) <= 6:
+                self.drag_mode = "resize_right"
+            else:
+                self.drag_mode = "move"
+            self.drag_start_x         = x
+            self.drag_clip_start_beat = clip.start_beat
+            self.drag_clip_duration   = clip.duration_beats
+            self.drag_clip_track      = t_idx
+        else:
+            # ---- Left-click on empty space: paint-drag ----
+            track_idx = int((y - self.HEADER_H) / self.TRACK_HEIGHT)
+            if 0 <= track_idx < len(self.daw.playlist_tracks):
+                self.daw.select_track(track_idx)
+                pat_idx = self.daw.selected_pattern_index
+                pat     = self.daw.patterns[pat_idx]
+                pat_len = max(pat.length_beats, 0.001)
+                snapped_beat = max(0.0, math.floor(self.x_to_beat(x) / pat_len) * pat_len)
+                new_clip = PlaylistClip(
+                    pattern_index=pat_idx, track_index=track_idx,
+                    start_beat=snapped_beat, duration_beats=pat_len,
+                )
+                self.daw.playlist_tracks[track_idx].clips.append(new_clip)
+                self.daw.playlist_tracks[track_idx].clips.sort(key=lambda c: c.start_beat)
+                self._invalidate_cache()
+                self._loop_paint_clip          = new_clip
+                self._loop_paint_track         = track_idx
+                self._loop_paint_start_x       = x
+                self._paint_drag_track         = track_idx
+                self._paint_drag_pat_idx       = pat_idx
+                self._paint_drag_painted_beats = {snapped_beat}
+                self.drag_mode                 = "paint"
+                self.selected_clip             = None
+                self.update()
+            else:
+                self.daw.playhead_song_beat = max(0.0, self.x_to_beat(x))
+                self.selected_clip = None
+                self.drag_mode     = None
+                self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        x = event.position().x()
+        y = event.position().y()
+
+        # ---- Loop-handle drag ----
+        if self.drag_mode == "loop_handle" and self._loop_drag:
+            beat = max(0.0, self.x_to_beat(x))
+            if self._loop_drag == "start":
+                self.daw.loop_start = min(beat, self.daw.loop_end - 0.25)
+            else:
+                self.daw.loop_end = max(beat, self.daw.loop_start + 0.25)
+            self.update()
+            return
+
+        # ---- Cursor hinting when idle ----
+        if not self.drag_mode and self._loop_paint_clip is None:
+            # Check loop handles first
+            hit = self._loop_handle_hit(x, y)
+            if hit:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
+            result = self.find_clip_at(x, y)
+            if result and x >= self.TRACK_HEADER_W:
+                t_idx, c_idx, clip = result
+                rect = self.clip_rect(t_idx, clip)
+                if abs(x - rect.left()) <= 6 or abs(x - rect.right()) <= 6:
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                self.hover_clip = (t_idx, c_idx)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.hover_clip = None
+
+        # ---- Right-click loop-extend drag ----
+        if self._loop_paint_clip is not None and self.drag_mode != "paint":
+            clip    = self._loop_paint_clip
+            pat     = self.daw.patterns[clip.pattern_index]
+            pat_len = max(pat.length_beats, 0.001)
+            dragged = self.x_to_beat(x) - clip.start_beat
+            loops   = max(1, math.ceil(dragged / pat_len))
+            new_dur = loops * pat_len
+            if new_dur != clip.duration_beats:
+                clip.duration_beats = new_dur
+                self._invalidate_cache()
+                self.update()
+            return
+
+        # ---- Left-click paint-drag ----
+        if self.drag_mode == "paint":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            track_idx = self._paint_drag_track
+            pat_idx   = self._paint_drag_pat_idx
+            painted   = self._paint_drag_painted_beats
+            if track_idx is None or pat_idx is None:
+                return
+            if track_idx >= len(self.daw.playlist_tracks):
+                return
+
+            pat       = self.daw.patterns[pat_idx]
+            pat_len   = max(pat.length_beats, 0.001)
+            beat_cur  = self.x_to_beat(x)
+            slot_beat = max(0.0, math.floor(beat_cur / pat_len) * pat_len)
+            track     = self.daw.playlist_tracks[track_idx]
+
+            if slot_beat not in painted:
+                occupied = any(
+                    c.start_beat <= slot_beat < c.start_beat + c.duration_beats
+                    for c in track.clips
+                    if c not in self._paint_drag_painted_clips()
+                )
+                if not occupied:
+                    new_clip = PlaylistClip(
+                        pattern_index=pat_idx, track_index=track_idx,
+                        start_beat=slot_beat, duration_beats=pat_len,
+                    )
+                    track.clips.append(new_clip)
+                    track.clips.sort(key=lambda c: c.start_beat)
+                    painted.add(slot_beat)
+                    self._paint_drag_painted_beats = painted
+                    self._loop_paint_clip          = new_clip
+                    self._invalidate_cache()
+                    self.update()
+            else:
+                # Loop-extend the clip already at this slot
+                target = next(
+                    (c for c in track.clips
+                     if abs(c.start_beat - slot_beat) < 0.001 and c.pattern_index == pat_idx),
+                    None,
+                )
+                if target is not None:
+                    dragged = beat_cur - target.start_beat
+                    loops   = max(1, math.ceil(dragged / pat_len))
+                    new_dur = loops * pat_len
+                    if new_dur != target.duration_beats:
+                        target.duration_beats  = new_dur
+                        self._loop_paint_clip  = target
+                        self._invalidate_cache()
+                        self.update()
+            return
+
+        # ---- Normal move / resize drag ----
+        if self.drag_mode and self.drag_mode not in ("paint", "loop_handle") and self.selected_clip:
+            t_idx, c_idx = self.selected_clip
+            clip         = self.daw.playlist_tracks[t_idx].clips[c_idx]
+            delta_beats  = (x - self.drag_start_x) / self.BEAT_W
+            snap         = self.daw.current_snap
+
+            if self.drag_mode == "move":
+                new_start = round((self.drag_clip_start_beat + delta_beats) / snap) * snap
+                clip.start_beat = max(0.0, new_start)
+                new_track = int((event.position().y() - self.HEADER_H) / self.TRACK_HEIGHT)
+                if 0 <= new_track < len(self.daw.playlist_tracks) and new_track != t_idx:
+                    clip.track_index = new_track
+                    self.daw.playlist_tracks[t_idx].clips.pop(c_idx)
+                    self.daw.playlist_tracks[new_track].clips.append(clip)
+                    self.daw.playlist_tracks[new_track].clips.sort(key=lambda c: c.start_beat)
+                    self.selected_clip    = (new_track, self.daw.playlist_tracks[new_track].clips.index(clip))
+                    self.drag_clip_track  = new_track
+            elif self.drag_mode == "resize_right":
+                new_dur = max(snap, round((self.drag_clip_duration + delta_beats) / snap) * snap)
+                clip.duration_beats = new_dur
+            elif self.drag_mode == "resize_left":
+                new_start = round((self.drag_clip_start_beat + delta_beats) / snap) * snap
+                end       = self.drag_clip_start_beat + self.drag_clip_duration
+                if new_start < end - snap:
+                    clip.start_beat     = max(0.0, new_start)
+                    clip.duration_beats = end - clip.start_beat
+
+            self._invalidate_cache()
+            self.update()
+
+    def _paint_drag_painted_clips(self) -> list:
+        painted   = getattr(self, "_paint_drag_painted_beats", set())
+        track_idx = getattr(self, "_paint_drag_track", None)
+        pat_idx   = getattr(self, "_paint_drag_pat_idx", None)
+        if track_idx is None or track_idx >= len(self.daw.playlist_tracks):
+            return []
+        track = self.daw.playlist_tracks[track_idx]
+        return [c for c in track.clips if c.start_beat in painted and c.pattern_index == pat_idx]
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.drag_mode                 = None
+        self._loop_drag                = None
+        self._loop_paint_clip          = None
+        self._loop_paint_track         = None
+        self._paint_drag_track         = None
+        self._paint_drag_pat_idx       = None
+        self._paint_drag_painted_beats = set()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        x = event.position().x()
+        y = event.position().y()
+        if x < self.TRACK_HEADER_W or y < self.HEADER_H:
+            return
+        result = self.find_clip_at(x, y)
+        if result:
+            _, _, clip = result
+            self.pattern_double_clicked.emit(clip.pattern_index)
+
+
+GRID_OPTIONS: List[Tuple[str, float]] = [
+    ("1/4", 1.0),
+    ("1/8", 0.5),
+    ("1/16", 0.25),
+    ("1/32", 0.125),
+    ("1/4T", 2.0 / 3.0),
+    ("1/8T", 1.0 / 3.0),
+    ("1/16T", 1.0 / 6.0),
+]
+LENGTH_OPTIONS: List[Tuple[str, float]] = [
+    ("1/1", 4.0),
+    ("1/2", 2.0),
+    ("1/4", 1.0),
+    ("1/8", 0.5),
+    ("1/16", 0.25),
+    ("1/32", 0.125),
+    ("1/4T", 2.0 / 3.0),
+    ("1/8T", 1.0 / 3.0),
+    ("1/16T", 1.0 / 6.0),
+    ("1/4D", 1.5),
+    ("1/8D", 0.75),
+    ("1/16D", 0.375),
+    ("1/32D", 0.1875),
+    ("2 Bars", 8.0),
+]
+GRID_LABEL_TO_VALUE = {k: v for k, v in GRID_OPTIONS}
+LENGTH_LABEL_TO_VALUE = {k: v for k, v in LENGTH_OPTIONS}
+GRID_VALUE_TO_LABEL = {round(v, 6): k for k, v in GRID_OPTIONS}
+LENGTH_VALUE_TO_LABEL = {round(v, 6): k for k, v in LENGTH_OPTIONS}
+DEFAULT_GRID = "1/16"
+DEFAULT_LENGTH = "1/4"
+
+
+def grid_value(label: str) -> float:
+    return float(GRID_LABEL_TO_VALUE.get(label, GRID_LABEL_TO_VALUE[DEFAULT_GRID]))
+
+
+def grid_label(value: float) -> str:
+    return GRID_VALUE_TO_LABEL.get(round(float(value), 6), DEFAULT_GRID)
+
+
+def length_value(label: str) -> float:
+    return float(LENGTH_LABEL_TO_VALUE.get(label, LENGTH_LABEL_TO_VALUE[DEFAULT_LENGTH]))
+
+
+def length_label(value: float) -> str:
+    return LENGTH_VALUE_TO_LABEL.get(round(float(value), 6), f"{value:.3f}")
+
+
+def beats_to_ms(beats: float, bpm: float) -> float:
+    return 0.0 if bpm <= 0 else float(beats) * 60000.0 / float(bpm)
+
+
+def pattern_mode(pattern: Pattern) -> str:
+    return pattern.mode
+
+
+def ensure_track(track: PlaylistTrack) -> PlaylistTrack:
+    track.track_type = str(track.track_type or "synth")
+    return track
+
+
+def ensure_pattern(pattern: Pattern) -> Pattern:
+    pattern.mode = str(pattern.mode or "synth")
+    pattern.step_count = 16 if pattern.step_count <= 16 else 32 if pattern.step_count <= 32 else 64
+    if pattern.step_duration not in GRID_LABEL_TO_VALUE:
+        pattern.step_duration = DEFAULT_GRID
+    pattern.swing = float(max(0.0, min(1.0, pattern.swing)))
+    pattern.drum_samples = [str(p) for p in pattern.drum_samples[:16]]
+    pattern.drum_grid = [[int(v) for v in row] for row in pattern.drum_grid]
+    if pattern_mode(pattern) == "drums":
+        rows = max(len(pattern.drum_samples), len(pattern.drum_grid), 8)
+        rows = min(16, max(1, rows))
+        grid = [[0 for _ in range(pattern.step_count)] for _ in range(rows)]
+        for r, row in enumerate(pattern.drum_grid[:rows]):
+            for s, value in enumerate(row[:pattern.step_count]):
+                grid[r][s] = int(max(0, min(127, value)))
+        pattern.drum_grid = grid
+        pattern.length_beats = max(0.25, pattern.step_count * grid_value(pattern.step_duration))
+    return pattern
+
+
+def pattern_to_dict(pattern: Pattern) -> dict:
+    return ensure_pattern(pattern).to_dict()
+
+
+def pattern_from_dict(data: dict) -> Pattern:
+    return ensure_pattern(Pattern.from_dict(data))
+
+
+def track_to_dict(track: PlaylistTrack) -> dict:
+    return ensure_track(track).to_dict()
+
+
+def track_from_dict(data: dict) -> PlaylistTrack:
+    return ensure_track(PlaylistTrack.from_dict(data))
+
+
+def _load_wave_stdlib(path: str):
+    import wave
+    with wave.open(path, "rb") as wf:
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    if width == 1:
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif width == 2:
+        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif width == 4:
+        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV width: {width}")
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+    return data.astype(np.float32), int(rate)
+
+
+def _resample_audio(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return data.astype(np.float32)
+    n = max(1, int(len(data) * target_sr / orig_sr))
+    return np.interp(np.linspace(0, len(data) - 1, n), np.arange(len(data)), data).astype(np.float32)
+
+
+def load_audio_file(path: str, target_sr: int = 44100) -> Optional[np.ndarray]:
+    data = None
+    sr = target_sr
+    if sf is not None:
+        try:
+            data, sr = sf.read(path, dtype="float32")
+            if getattr(data, "ndim", 1) > 1:
+                data = data.mean(axis=1)
+        except Exception:
+            data = None
+    if data is None and path.lower().endswith(".wav"):
+        try:
+            data, sr = _load_wave_stdlib(path)
+        except Exception:
+            data = None
+    if data is None:
+        return None
+    if sr != target_sr:
+        data = _resample_audio(data, sr, target_sr)
+    peak = float(np.max(np.abs(data))) if len(data) else 0.0
+    if peak > 0:
+        data = data / peak * 0.8
+    return data.astype(np.float32)
+
+
+class SampleVoice:
+    def __init__(self, buffer: np.ndarray, velocity: float = 1.0):
+        self.buffer = buffer
+        self.pos = 0
+        self.velocity = float(velocity)
+
+
+class Sampler:
+    def __init__(self, sample_rate: int = 44100):
+        self.sample_rate = sample_rate
+        self.samples: List[np.ndarray] = []
+        self.source_paths: List[str] = []
+        self._voices: List[SampleVoice] = []
+        self._lock = threading.Lock()
+
+    def set_samples(self, paths: List[str]) -> int:
+        with self._lock:
+            self.samples.clear()
+            self.source_paths.clear()
+            self._voices.clear()
+        count = 0
+        for path in paths:
+            data = load_audio_file(path, self.sample_rate)
+            if data is not None:
+                self.samples.append(data)
+                self.source_paths.append(path)
+                count += 1
+        return count
+
+    def trigger(self, sample_index: int, velocity: float = 1.0) -> None:
+        with self._lock:
+            if 0 <= sample_index < len(self.samples):
+                self._voices.append(SampleVoice(self.samples[sample_index], velocity))
+
+    def generate_audio(self, frames: int) -> np.ndarray:
+        out = np.zeros(frames, dtype=np.float32)
+        with self._lock:
+            dead = []
+            for i, voice in enumerate(self._voices):
+                remain = len(voice.buffer) - voice.pos
+                if remain <= 0:
+                    dead.append(i)
+                    continue
+                n = min(frames, remain)
+                out[:n] += voice.buffer[voice.pos:voice.pos + n] * voice.velocity
+                voice.pos += n
+                if voice.pos >= len(voice.buffer):
+                    dead.append(i)
+            for i in reversed(dead):
+                self._voices.pop(i)
+        return out.astype(np.float32)
+
+
+class PianoRoll(QWidget):
+    note_changed = Signal()
+
+    KEYBOARD_W = 92
+    HEADER_H = 30
+    MIN_MIDI = 36
+    MAX_MIDI = 96
+    DRUM_LIST_W = 190
+
+    def __init__(self, daw: "Nill") -> None:
+        super().__init__()
+        self.daw = daw
+        self.setMinimumSize(640, 320)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+        self.mode = "synth"
+        self.selected_note: Optional[Note] = None
+        self.selected_cells: set[Tuple[int, int]] = set()
+        self.selected_sample_row = 0
+        self.drag_mode: Optional[str] = None
+        self.drag_note_start_beat = 0.0
+        self.drag_note_start_pitch = 60
+        self.drag_note_start_duration = 1.0
+        self.drag_origin_beat = 0.0
+        self.drag_origin_pitch = 60
+        self.drag_paint_value = 100
+        self.preview_key: Optional[str] = None
+        self.zoom_x = 1.0
+        self.zoom_y = 1.0
+        self.hover_beat: Optional[float] = None
+        self.hover_pitch: Optional[int] = None
+        self.hover_cell: Optional[Tuple[int, int]] = None
+        self.hover_sample_row: Optional[int] = None
+        self.ghosts: List[dict] = []
+        self.clipboard_notes: List[dict] = []
+        self.clipboard_cells: List[dict] = []
+        self.undo_stack: List[Tuple[int, str]] = []
+        self.snap_flash_until = 0.0
+        self.snap_text = ""
+        self.drag_dirty = False
+
+        self.audition_timer = QTimer(self)
+        self.audition_timer.setInterval(15)
+        self.audition_timer.timeout.connect(self._advance_audition)
+        self.audition_playing = False
+        self.audition_step = -1
+        self.next_audition_time = 0.0
+
+    def current_pattern(self) -> Pattern:
+        return ensure_pattern(self.daw.current_pattern())
+
+    def switch_mode(self, mode: str) -> None:
+        mode = "drums" if mode == "drums" else "synth"
+        if self.mode == "drums" and mode != "drums":
+            self.stop_audition()
+        self.mode = mode
+        self.drag_mode = None
+        self.selected_cells.clear()
+        self.update_ghosts()
+        self.update()
+
+    def push_undo(self) -> None:
+        idx = self.daw.selected_pattern_index
+        state = json.dumps(pattern_to_dict(self.daw.patterns[idx]), sort_keys=True)
+        if self.undo_stack and self.undo_stack[-1] == (idx, state):
+            return
+        self.undo_stack.append((idx, state))
+        self.undo_stack = self.undo_stack[-80:]
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            self.daw.set_status("Nothing to undo")
+            return
+        idx, state = self.undo_stack.pop()
+        self.daw.patterns[idx] = pattern_from_dict(json.loads(state))
+        if pattern_mode(self.daw.patterns[idx]) == "drums":
+            self.daw.ensure_pattern_sampler(idx, force=True)
+            self.daw.sync_clip_durations_for_pattern(idx)
+        self.daw.sync_ui()
+        self.note_changed.emit()
+        self.update()
+        self.daw.set_status("Undo")
+
+    @property
+    def total_rows(self) -> int:
+        return self.MAX_MIDI - self.MIN_MIDI + 1
+
+    @property
+    def BEAT_W(self) -> float:
+        pat = self.current_pattern()
+        vw = self.width()
+        if hasattr(self.daw, "piano_scroll"):
+            vw = self.daw.piano_scroll.viewport().width()
+        return max(14.0, max(120.0, vw - self.KEYBOARD_W) / max(1.0, pat.length_beats)) * self.zoom_x
+
+    @property
+    def ROW_H(self) -> float:
+        vh = self.height()
+        if hasattr(self.daw, "piano_scroll"):
+            vh = self.daw.piano_scroll.viewport().height()
+        return max(10.0, max(220.0, vh - self.HEADER_H) / self.total_rows) * self.zoom_y
+
+    def drum_step_w(self) -> float:
+        return max(18.0, 28.0 * self.zoom_x)
+
+    def drum_row_h(self) -> float:
+        return max(20.0, 28.0 * self.zoom_y)
+
+    def beat_to_x(self, beat: float) -> float:
+        return self.KEYBOARD_W + beat * self.BEAT_W
+
+    def x_to_beat(self, x: float) -> float:
+        return max(0.0, (x - self.KEYBOARD_W) / self.BEAT_W)
+
+    def pitch_to_y(self, pitch: int) -> float:
+        return self.HEADER_H + (self.MAX_MIDI - pitch) * self.ROW_H
+
+    def y_to_pitch(self, y: float) -> int:
+        row = int((y - self.HEADER_H) / self.ROW_H)
+        row = max(0, min(self.total_rows - 1, row))
+        return self.MAX_MIDI - row
+
+    def snap(self, value: float) -> float:
+        if not self.daw.snap_enabled:
+            return value
+        s = self.daw.current_snap
+        return round(value / s) * s if s > 0 else value
+
+    def note_rect(self, note: Note) -> QRectF:
+        return QRectF(self.beat_to_x(note.start), self.pitch_to_y(note.pitch) + 1, max(6.0, note.duration * self.BEAT_W), self.ROW_H - 2)
+
+    def find_note_at(self, x: float, y: float) -> Optional[Note]:
+        for note in reversed(self.current_pattern().notes):
+            if self.note_rect(note).contains(x, y):
+                return note
+        return None
+
+    def drum_rows(self) -> int:
+        return len(self.current_pattern().drum_grid)
+
+    def drum_step_beats(self) -> float:
+        return grid_value(self.current_pattern().step_duration)
+
+    def drum_beat_to_x(self, beat: float) -> float:
+        return self.DRUM_LIST_W + beat * self.BEAT_W
+
+    def drum_x_to_beat(self, x: float) -> float:
+        return max(0.0, (x - self.DRUM_LIST_W) / self.BEAT_W)
+
+    def sample_rect(self, row: int) -> QRectF:
+        return QRectF(0, self.HEADER_H + row * self.drum_row_h(), self.DRUM_LIST_W, self.drum_row_h())
+
+    def drum_note_rect(self, row: int, step: int) -> QRectF:
+        step_beats = self.drum_step_beats()
+        start = step * step_beats
+        return QRectF(self.drum_beat_to_x(start), self.HEADER_H + row * self.drum_row_h() + 1, max(8.0, step_beats * self.BEAT_W), self.drum_row_h() - 2)
+
+    def cell_rect(self, row: int, step: int) -> QRectF:
+        return self.drum_note_rect(row, step)
+
+    def sample_name(self, row: int) -> str:
+        pat = self.current_pattern()
+        return Path(pat.drum_samples[row]).stem if row < len(pat.drum_samples) else f"Slot {row + 1}"
+
+    def step_at_beat(self, beat: float) -> int:
+        step_beats = max(0.03125, self.drum_step_beats())
+        return int(max(0, math.floor(beat / step_beats + 1e-9)))
+
+    def cell_at(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        pat = self.current_pattern()
+        if x < self.DRUM_LIST_W or y < self.HEADER_H:
+            return None
+        row = int((y - self.HEADER_H) / self.drum_row_h())
+        step = self.step_at_beat(self.drum_x_to_beat(x))
+        return (row, step) if 0 <= row < len(pat.drum_grid) and 0 <= step < pat.step_count else None
+
+    def sample_row_at(self, x: float, y: float) -> Optional[int]:
+        if x >= self.DRUM_LIST_W or y < self.HEADER_H:
+            return None
+        row = int((y - self.HEADER_H) / self.drum_row_h())
+        return row if 0 <= row < self.drum_rows() else None
+
+    def ghost_color(self, base: str = "#E6E6E6") -> QColor:
+        color = QColor(base).lighter(140)
+        color.setAlpha(110)
+        return color
+
+    def flash_snap(self, text: str) -> None:
+        self.snap_flash_until = time.perf_counter() + 0.12
+        self.snap_text = text
+
+    def update_ghosts(self) -> None:
+        self.ghosts = []
+        if not self.daw.show_ghost_notes:
+            self.update()
+            return
+        if self.mode == "synth":
+            if self.clipboard_notes and self.hover_beat is not None and self.hover_pitch is not None:
+                beat = self.snap(self.hover_beat)
+                for item in self.clipboard_notes:
+                    self.ghosts.append({"kind": "note", "beat": beat + item["start"], "pitch": self.hover_pitch + item["pitch"], "length": item["duration"]})
+            elif self.drag_mode and self.selected_note:
+                self.ghosts.append({"kind": "note", "beat": self.selected_note.start, "pitch": self.selected_note.pitch, "length": self.selected_note.duration})
+                if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier and self.daw.snap_enabled:
+                    b0, b1 = sorted([self.drag_note_start_beat, self.selected_note.start])
+                    step = self.daw.current_snap
+                    beat = self.snap(b0)
+                    while beat <= b1 + 1e-9:
+                        self.ghosts.append({"kind": "note", "beat": beat, "pitch": self.selected_note.pitch, "length": self.selected_note.duration})
+                        beat += step
+            elif self.hover_beat is not None and self.hover_pitch is not None:
+                self.ghosts.append({"kind": "note", "beat": self.snap(self.hover_beat), "pitch": self.hover_pitch, "length": self.daw.current_note_length})
+        elif self.clipboard_cells and self.hover_cell:
+            r0, s0 = self.hover_cell
+            for item in self.clipboard_cells:
+                self.ghosts.append({"kind": "cell", "row": r0 + item["row"], "step": s0 + item["step"]})
+        self.update()
+
+    def render_ghosts(self, painter: QPainter) -> None:
+        pen = QPen(self.ghost_color(), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        for ghost in self.ghosts:
+            if ghost["kind"] == "note":
+                pitch = max(self.MIN_MIDI, min(self.MAX_MIDI, ghost["pitch"]))
+                rect = QRectF(self.beat_to_x(ghost["beat"]), self.pitch_to_y(pitch) + 1, max(6.0, ghost["length"] * self.BEAT_W), self.ROW_H - 2)
+                painter.fillRect(rect, self.ghost_color())
+                painter.drawRect(rect)
+            else:
+                row, step = ghost["row"], ghost["step"]
+                if 0 <= row < self.drum_rows() and 0 <= step < self.current_pattern().step_count:
+                    rect = self.drum_note_rect(row, step).adjusted(0, 0, -1, 0)
+                    painter.fillRect(rect, self.ghost_color())
+                    painter.drawRect(rect)
+
+    def is_black(self, pitch: int) -> bool:
+        return pitch % 12 in {1, 3, 6, 8, 10}
+
+    def note_name(self, pitch: int) -> str:
+        return f"{NOTE_NAMES[pitch % 12]}{(pitch // 12) - 1}"
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        if self.mode == "drums":
+            self.paint_drums(painter)
+        else:
+            self.paint_synth(painter)
+
+    def paint_synth(self, painter: QPainter) -> None:
+        pat = self.current_pattern()
+        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
+        painter.fillRect(0, 0, self.KEYBOARD_W, self.height(), QColor("#050505"))
+        right = self.beat_to_x(pat.length_beats)
+
+        if self.hover_pitch is not None:
+            painter.fillRect(QRectF(self.KEYBOARD_W, self.pitch_to_y(self.hover_pitch), max(0, right - self.KEYBOARD_W), self.ROW_H), QColor(255, 255, 255, 16))
+
+        for pitch in range(self.MAX_MIDI, self.MIN_MIDI - 1, -1):
+            y = self.pitch_to_y(pitch)
+            row = QRectF(self.KEYBOARD_W, y, max(0, right - self.KEYBOARD_W), self.ROW_H)
+            key = QRectF(0, y, self.KEYBOARD_W, self.ROW_H)
+            kc, rc = (QColor("#202020"), QColor("#141414")) if self.is_black(pitch) else (QColor("#E6E6E6"), QColor("#181818"))
+            painter.fillRect(row, rc)
+            painter.fillRect(key, kc)
+            painter.setPen(QPen(QColor("#333333") if pitch % 12 == 0 else QColor("#262626"), 1))
+            painter.drawLine(int(self.KEYBOARD_W), int(y), int(right), int(y))
+            painter.setPen(QColor("#111") if not self.is_black(pitch) else QColor("#EEE"))
+            painter.setFont(QFont("Consolas", 8))
+            painter.drawText(key.adjusted(6, 0, -4, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.note_name(pitch))
+
+        if self.daw.show_grid or self.daw.snap_enabled:
+            step = self.daw.current_snap
+            count = int(pat.length_beats / step) + 2
+            for i in range(count):
+                beat = i * step
+                x = self.beat_to_x(beat)
+                color = QColor("#5A5A5A") if abs(beat % 4.0) < 1e-6 else QColor("#444444") if abs(beat % 1.0) < 1e-6 else QColor("#262626")
+                if not self.daw.show_grid and not self.daw.snap_enabled:
+                    color = QColor("#1A1A1A")
+                painter.setPen(QPen(color, 1))
+                painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
+
+        painter.setPen(QPen(QColor("#C8C8C8"), 1))
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        for beat in range(int(math.ceil(pat.length_beats)) + 1):
+            x = self.beat_to_x(float(beat))
+            painter.drawLine(int(x), 0, int(x), self.HEADER_H)
+            if beat < pat.length_beats:
+                painter.drawText(int(x + 4), 20, str(beat + 1))
+        painter.setPen(QColor("#999"))
+        painter.drawText(self.KEYBOARD_W + 8, 20, f"{pat.name} | Synth | Snap {'ON' if self.daw.snap_enabled else 'OFF'} {self.daw.current_grid_label}")
+
+        self.render_ghosts(painter)
+        for note in pat.notes:
+            rect = self.note_rect(note)
+            fill = QColor(pat.color if not note.muted else "#5F5F5F")
+            border = QColor("#FFF") if note is self.selected_note else QColor("#F4F4F4")
+            if note is self.selected_note:
+                fill = fill.lighter(135)
+            painter.fillRect(rect, fill)
+            painter.setPen(QPen(border, 1))
+            painter.drawRect(rect)
+
+        if self.daw.playing and pat.length_beats > 0:
+            x = self.beat_to_x(self.daw.playhead_song_beat % pat.length_beats)
+            painter.setPen(QPen(QColor("#FFF"), 2))
+            painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
+
+        if time.perf_counter() < self.snap_flash_until and self.hover_beat is not None:
+            x = self.beat_to_x(self.snap(self.hover_beat))
+            painter.setPen(QPen(QColor(255, 255, 255, 120), 2))
+            painter.drawLine(int(x), self.HEADER_H, int(x), self.height())
+            painter.drawText(self.KEYBOARD_W + 12, self.HEADER_H + 18, self.snap_text)
+        painter.setPen(QPen(QColor("#4A4A4A"), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+    def draw_wave(self, painter: QPainter, rect: QRectF, row: int) -> None:
+        sampler = self.daw.samplers.get(self.daw.selected_pattern_index)
+        if not sampler or row >= len(sampler.samples):
+            return
+        data = sampler.samples[row]
+        if len(data) < 8:
+            return
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        stride = max(1, len(data) // max(1, int(rect.width())))
+        mid = rect.center().y()
+        for x in range(max(1, int(rect.width()))):
+            idx = min(len(data) - 1, x * stride)
+            amp = float(data[idx])
+            yy = rect.height() * 0.42
+            painter.drawLine(int(rect.left() + x), int(mid - amp * yy), int(rect.left() + x), int(mid + amp * yy))
+
+    def runtime_step(self) -> int:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return -1
+        if self.audition_playing:
+            return self.audition_step
+        if not self.daw.playing:
+            return -1
+        step_beats = grid_value(pat.step_duration)
+        local = self.daw.playhead_song_beat % max(0.0001, pat.length_beats)
+        return max(0, min(pat.step_count - 1, int(local / step_beats)))
+
+    def paint_drums(self, painter: QPainter) -> None:
+        pat = self.current_pattern()
+        painter.fillRect(self.rect(), QColor("#0B0B0B"))
+        painter.fillRect(0, 0, self.width(), self.HEADER_H, QColor("#151515"))
+        painter.fillRect(0, self.HEADER_H, self.DRUM_LIST_W, self.height() - self.HEADER_H, QColor("#101010"))
+        painter.setPen(QColor("#999"))
+        painter.drawText(self.DRUM_LIST_W + 8, 20, f"{pat.name} | Drum Piano Roll | {pat.step_count} notes | {pat.step_duration} | Swing {int(pat.swing * 100)}%")
+
+        rows = self.drum_rows()
+        step_beats = self.drum_step_beats()
+        total_beats = pat.length_beats
+        right = self.drum_beat_to_x(total_beats)
+        current = self.runtime_step()
+
+        if self.hover_sample_row is not None:
+            painter.fillRect(self.sample_rect(self.hover_sample_row), QColor(255, 255, 255, 15))
+        if self.hover_cell is not None:
+            row, step = self.hover_cell
+            painter.fillRect(QRectF(self.DRUM_LIST_W, self.HEADER_H + row * self.drum_row_h(), max(0, right - self.DRUM_LIST_W), self.drum_row_h()), QColor(255, 255, 255, 10))
+            painter.fillRect(self.drum_note_rect(row, step), QColor(255, 255, 255, 20))
+
+        for row in range(rows):
+            srect = self.sample_rect(row)
+            fill = QColor("#181818") if row == self.selected_sample_row else QColor("#141414") if row % 2 == 0 else QColor("#111111")
+            painter.fillRect(srect, fill)
+            row_rect = QRectF(self.DRUM_LIST_W, self.HEADER_H + row * self.drum_row_h(), max(0, right - self.DRUM_LIST_W), self.drum_row_h())
+            painter.fillRect(row_rect, QColor("#181818") if row % 2 == 0 else QColor("#151515"))
+            painter.setPen(QColor("#EEE"))
+            painter.setFont(QFont("Consolas", 8))
+            painter.drawText(srect.adjusted(6, 0, -6, -srect.height() / 2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.sample_name(row))
+            self.draw_wave(painter, srect.adjusted(6, srect.height() / 2 - 1, -6, -4), row)
+            painter.setPen(QPen(QColor("#2A2A2A"), 1))
+            painter.drawLine(0, int(srect.bottom()), int(right), int(srect.bottom()))
+
+        if self.daw.show_grid or self.daw.snap_enabled:
+            snap = self.daw.current_snap if self.daw.current_snap > 0 else step_beats
+            count = int(math.ceil(total_beats / snap)) + 1
+            for i in range(count + 1):
+                beat = i * snap
+                x = self.drum_beat_to_x(beat)
+                color = QColor("#5A5A5A") if abs(beat % 4.0) < 1e-6 else QColor("#444444") if abs(beat % 1.0) < 1e-6 else QColor("#262626")
+                painter.setPen(QPen(color, 1))
+                painter.drawLine(int(x), self.HEADER_H, int(x), int(self.HEADER_H + rows * self.drum_row_h()))
+
+        self.render_ghosts(painter)
+
+        for row in range(rows):
+            for step in range(pat.step_count):
+                vel = int(pat.drum_grid[row][step])
+                if vel <= 0:
+                    continue
+                rect = self.drum_note_rect(row, step).adjusted(0, 0, -1, 0)
+                fill = QColor(*([min(255, 80 + vel)] * 3))
+                if (row, step) in self.selected_cells:
+                    fill = fill.lighter(125)
+                border = QColor("#FFFFFF") if step == current else QColor("#DADADA")
+                painter.fillRect(rect, fill)
+                painter.setPen(QPen(border, 1))
+                painter.drawRect(rect)
+
+        painter.setPen(QPen(QColor("#C8C8C8"), 1))
+        painter.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        for beat in range(int(math.ceil(total_beats)) + 1):
+            x = self.drum_beat_to_x(float(beat))
+            painter.drawLine(int(x), 0, int(x), self.HEADER_H)
+            if beat < total_beats:
+                painter.drawText(int(x + 4), 20, str(beat + 1))
+
+        if current >= 0:
+            x = self.drum_beat_to_x(current * step_beats)
+            painter.setPen(QPen(QColor("#FFFFFF"), 2))
+            painter.drawLine(int(x), self.HEADER_H, int(x), int(self.HEADER_H + rows * self.drum_row_h()))
+
+        painter.setPen(QPen(QColor("#4A4A4A"), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+    def handle_spacebar(self) -> bool:
+        if self.mode == "drums":
+            self.toggle_audition()
+            return True
+        if self.mode == "synth" and self.hover_pitch is not None:
+            if self.preview_key:
+                self.daw.preview_note_off(self.preview_key)
+            self.preview_key = f"hover-{time.time_ns()}"
+            self.daw.preview_note_on(self.preview_key, self.hover_pitch)
+            QTimer.singleShot(160, lambda key=self.preview_key: self._finish_preview(key))
+            return True
+        return False
+
+    def _finish_preview(self, key: str) -> None:
+        if self.preview_key == key:
+            self.daw.preview_note_off(key)
+            self.preview_key = None
+
+    def mousePressEvent(self, event) -> None:
+        self.setFocus()
+        if self.mode == "drums":
+            self.mousePressDrums(event)
+        else:
+            self.mousePressSynth(event)
+
+    def mousePressSynth(self, event) -> None:
+        x, y = event.position().x(), event.position().y()
+        if y < self.HEADER_H:
+            return
+        if x < self.KEYBOARD_W and event.button() == Qt.MouseButton.LeftButton:
+            self.preview_key = f"preview-{time.time_ns()}"
+            self.daw.preview_note_on(self.preview_key, self.y_to_pitch(y))
+            return
+        clicked = self.find_note_at(x, y)
+        self.selected_note = clicked
+        if event.button() == Qt.MouseButton.RightButton:
+            if clicked:
+                self.push_undo()
+                self.current_pattern().notes.remove(clicked)
+                self.selected_note = None
+                self.note_changed.emit()
+                self.update_ghosts()
+            self.update()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        beat = self.snap(self.x_to_beat(x))
+        pitch = self.y_to_pitch(y)
+        if clicked:
+            rect = self.note_rect(clicked)
+            self.drag_mode = "resize_left" if abs(x - rect.left()) <= 6 else "resize_right" if abs(x - rect.right()) <= 8 else "move"
+            self.drag_origin_beat = beat
+            self.drag_origin_pitch = pitch
+            self.drag_note_start_beat = clicked.start
+            self.drag_note_start_pitch = clicked.pitch
+            self.drag_note_start_duration = clicked.duration
+            self.drag_dirty = False
+        else:
+            self.push_undo()
+            new = Note(pitch=pitch, start=max(0.0, beat), duration=self.daw.current_note_length, velocity=100)
+            self.current_pattern().notes.append(new)
+            self.current_pattern().notes.sort(key=lambda n: (n.start, n.pitch))
+            self.selected_note = new
+            self.flash_snap(f"Placed @ {self.daw.current_grid_label}")
+            self.note_changed.emit()
+            self.update_ghosts()
+            self.update()
+
+    def mousePressDrums(self, event) -> None:
+        x, y = event.position().x(), event.position().y()
+        pat = self.current_pattern()
+        if y < self.HEADER_H:
+            return
+        row = self.sample_row_at(x, y)
+        if row is not None:
+            self.selected_sample_row = row
+            if event.button() == Qt.MouseButton.RightButton:
+                self.daw.trigger_drum_sample(self.daw.selected_pattern_index, row, 120)
+            self.update()
+            return
+        cell = self.cell_at(x, y)
+        if cell is None:
+            return
+        row, step = cell
+        self.selected_sample_row = row
+        if event.button() == Qt.MouseButton.RightButton:
+            targets = self.selected_cells if cell in self.selected_cells and self.selected_cells else {cell}
+            current = max(pat.drum_grid[r][s] for r, s in targets)
+            value, ok = QInputDialog.getInt(self, "Velocity", "Velocity (0-127):", current, 0, 127)
+            if ok:
+                self.push_undo()
+                for r, s in targets:
+                    pat.drum_grid[r][s] = value
+                self.note_changed.emit()
+            self.update()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        mods = QApplication.keyboardModifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            if cell in self.selected_cells:
+                self.selected_cells.discard(cell)
+            else:
+                self.selected_cells.add(cell)
+            self.update()
+            return
+        self.push_undo()
+        self.selected_cells = {cell}
+        self.drag_mode = "paint_cells"
+        self.drag_paint_value = 0 if pat.drum_grid[row][step] > 0 else 100
+        pat.drum_grid[row][step] = self.drag_paint_value
+        if self.drag_paint_value > 0:
+            self.daw.trigger_drum_sample(self.daw.selected_pattern_index, row, self.drag_paint_value)
+        self.drag_dirty = True
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        x, y = event.position().x(), event.position().y()
+        if self.mode == "drums":
+            self.hover_cell = self.cell_at(x, y)
+            self.hover_sample_row = self.sample_row_at(x, y)
+            if self.drag_mode == "paint_cells":
+                cell = self.cell_at(x, y)
+                if cell is not None:
+                    r, s = cell
+                    if self.current_pattern().drum_grid[r][s] != self.drag_paint_value:
+                        self.current_pattern().drum_grid[r][s] = self.drag_paint_value
+                        if self.drag_paint_value > 0:
+                            self.daw.trigger_drum_sample(self.daw.selected_pattern_index, r, self.drag_paint_value)
+                        self.selected_cells = {cell}
+                        self.drag_dirty = True
+            self.update_ghosts()
+            self.update()
+            return
+
+        self.hover_beat = self.x_to_beat(x) if x >= self.KEYBOARD_W and y >= self.HEADER_H else None
+        self.hover_pitch = self.y_to_pitch(y) if x >= self.KEYBOARD_W and y >= self.HEADER_H else None
+        if self.drag_mode and self.selected_note:
+            beat = self.snap(self.x_to_beat(x)) if self.daw.snap_enabled else self.x_to_beat(x)
+            pitch = self.y_to_pitch(y)
+            if self.drag_mode == "move":
+                db = beat - self.drag_origin_beat
+                dp = pitch - self.drag_origin_pitch
+                self.selected_note.start = max(0.0, min(self.current_pattern().length_beats - self.selected_note.duration, self.drag_note_start_beat + db))
+                self.selected_note.pitch = max(self.MIN_MIDI, min(self.MAX_MIDI, self.drag_note_start_pitch + dp))
+            elif self.drag_mode == "resize_right":
+                self.selected_note.duration = max(self.daw.current_snap if self.daw.snap_enabled else 0.0625, beat - self.selected_note.start)
+            elif self.drag_mode == "resize_left":
+                end = self.drag_note_start_beat + self.drag_note_start_duration
+                start = max(0.0, min(end - 0.0625, beat))
+                self.selected_note.start = start
+                self.selected_note.duration = max(0.0625, end - start)
+            self.flash_snap(f"Snap: {self.daw.current_grid_label}")
+            self.drag_dirty = True
+            self.note_changed.emit()
+            self.update_ghosts()
+            self.update()
+        else:
+            note = self.find_note_at(x, y) if x >= self.KEYBOARD_W else None
+            if note:
+                rect = self.note_rect(note)
+                self.setCursor(Qt.CursorShape.SizeHorCursor if abs(x - rect.left()) <= 6 or abs(x - rect.right()) <= 8 else Qt.CursorShape.OpenHandCursor)
+            elif x < self.KEYBOARD_W:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update_ghosts()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.drag_mode in {"resize_left", "resize_right"} and self.selected_note and self.drag_dirty:
+            self.daw.set_note_length(self.selected_note.duration)
+        self.drag_mode = None
+        self.drag_dirty = False
+        if self.preview_key:
+            self.daw.preview_note_off(self.preview_key)
+            self.preview_key = None
+        self.update_ghosts()
+        self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self.mode != "drums":
+            return
+        cell = self.cell_at(event.position().x(), event.position().y())
+        if cell:
+            self.push_undo()
+            r, s = cell
+            self.current_pattern().drum_grid[r][s] = 127
+            self.selected_cells = {cell}
+            self.daw.trigger_drum_sample(self.daw.selected_pattern_index, r, 127)
+            self.note_changed.emit()
+            self.update()
+
+    def leaveEvent(self, event) -> None:
+        if self.preview_key:
+            self.daw.preview_note_off(self.preview_key)
+            self.preview_key = None
+        self.hover_beat = None
+        self.hover_pitch = None
+        self.hover_cell = None
+        self.hover_sample_row = None
+        self.update_ghosts()
+
+    def delete_selected(self) -> None:
+        if self.mode == "drums":
+            if not self.selected_cells:
+                return
+            self.push_undo()
+            for r, s in self.selected_cells:
+                self.current_pattern().drum_grid[r][s] = 0
+            self.note_changed.emit()
+            self.update()
+            return
+        if self.selected_note and self.selected_note in self.current_pattern().notes:
+            self.push_undo()
+            self.current_pattern().notes.remove(self.selected_note)
+            self.selected_note = None
+            self.note_changed.emit()
+            self.update()
+
+    def copy_selection(self) -> None:
+        if self.mode == "drums":
+            cells = sorted(self.selected_cells)
+            if not cells:
+                pat = self.current_pattern()
+                cells = [(r, s) for r, row in enumerate(pat.drum_grid) for s, v in enumerate(row) if v > 0]
+            if not cells:
+                return
+            min_r = min(r for r, _ in cells)
+            min_s = min(s for _, s in cells)
+            pat = self.current_pattern()
+            self.clipboard_cells = [{"row": r - min_r, "step": s - min_s, "velocity": pat.drum_grid[r][s]} for r, s in cells if pat.drum_grid[r][s] > 0]
+            self.daw.set_status(f"Ready to paste {len(self.clipboard_cells)} drum cells")
+        else:
+            notes = [self.selected_note] if self.selected_note else list(self.current_pattern().notes)
+            notes = [n for n in notes if n is not None]
+            if not notes:
+                return
+            base_note = min(notes, key=lambda n: (n.start, n.pitch))
+            self.clipboard_notes = [{"start": n.start - base_note.start, "pitch": n.pitch - base_note.pitch, "duration": n.duration, "velocity": n.velocity} for n in notes]
+            self.daw.set_status(f"Ready to paste {len(self.clipboard_notes)} notes")
+        self.update_ghosts()
+
+    def paste_selection(self) -> None:
+        if self.mode == "drums":
+            if not self.clipboard_cells:
+                return
+            anchor = self.hover_cell or (self.selected_sample_row, 0)
+            self.push_undo()
+            pat = self.current_pattern()
+            for item in self.clipboard_cells:
+                r, s = anchor[0] + item["row"], anchor[1] + item["step"]
+                if 0 <= r < len(pat.drum_grid) and 0 <= s < pat.step_count:
+                    pat.drum_grid[r][s] = int(item["velocity"])
+            self.note_changed.emit()
+            self.update()
+            return
+        if not self.clipboard_notes:
+            return
+        self.push_undo()
+        anchor_beat = self.snap(self.hover_beat if self.hover_beat is not None else 0.0)
+        anchor_pitch = self.hover_pitch if self.hover_pitch is not None else 60
+        created = []
+        for item in self.clipboard_notes:
+            start = max(0.0, anchor_beat + item["start"])
+            if start >= self.current_pattern().length_beats:
+                continue
+            dur = min(item["duration"], self.current_pattern().length_beats - start)
+            created.append(Note(pitch=max(self.MIN_MIDI, min(self.MAX_MIDI, anchor_pitch + item["pitch"])), start=start, duration=max(0.0625, dur), velocity=item["velocity"]))
+        self.current_pattern().notes.extend(created)
+        self.current_pattern().notes.sort(key=lambda n: (n.start, n.pitch))
+        self.selected_note = created[0] if created else None
+        self.note_changed.emit()
+        self.update_ghosts()
+        self.update()
+
+    def quantize(self) -> None:
+        if self.mode != "synth":
+            return
+        notes = [self.selected_note] if self.selected_note else list(self.current_pattern().notes)
+        notes = [n for n in notes if n is not None]
+        if not notes:
+            return
+        old = list(self.ghosts)
+        self.ghosts = [{"kind": "note", "beat": self.snap(n.start), "pitch": n.pitch, "length": max(self.daw.current_snap, self.snap(n.duration))} for n in notes]
+        self.update()
+        if QMessageBox.question(self, "Quantize", f"Quantize {len(notes)} notes to {self.daw.current_grid_label}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self.push_undo()
+            for n in notes:
+                n.start = self.snap(n.start)
+                n.duration = max(self.daw.current_snap, self.snap(n.duration))
+            self.note_changed.emit()
+        self.ghosts = old
+        self.update_ghosts()
+        self.update()
+
+    def toggle_audition(self) -> None:
+        if self.audition_playing:
+            self.stop_audition()
+        else:
+            self.play_audition()
+
+    def play_audition(self) -> None:
+        if self.mode != "drums":
+            return
+        self.audition_playing = True
+        self.audition_step = -1
+        self.next_audition_time = time.perf_counter()
+        self.audition_timer.start()
+        self._advance_audition()
+
+    def stop_audition(self) -> None:
+        self.audition_playing = False
+        self.audition_step = -1
+        self.audition_timer.stop()
+        self.daw.sync_drum_panel(runtime_only=True)
+        self.update()
+
+    def step_seconds(self, idx: int) -> float:
+        pat = self.current_pattern()
+        base = 60.0 / max(1.0, float(self.daw.bpm)) * grid_value(pat.step_duration)
+        swing = max(0.0, min(0.95, float(pat.swing)))
+        if idx % 2 == 0:
+            return base * (1.0 - swing * 0.45)
+        return base * (1.0 + swing * 0.45)
+
+    def metronome_click(self) -> None:
+        key = f"metro-{time.time_ns()}"
+        self.daw.synth.note_on(key, 96, velocity=0.22, waveform="square", gain=0.16)
+        QTimer.singleShot(60, lambda k=key: self.daw.synth.note_off(k))
+
+    def _advance_audition(self) -> None:
+        if not self.audition_playing:
+            return
+        now = time.perf_counter()
+        if now < self.next_audition_time:
+            return
+        pat = self.current_pattern()
+        self.audition_step = (self.audition_step + 1) % pat.step_count
+        for row, row_data in enumerate(pat.drum_grid):
+            vel = int(row_data[self.audition_step])
+            if vel > 0:
+                self.daw.trigger_drum_sample(self.daw.selected_pattern_index, row, vel)
+        beat_steps = max(1, int(round(1.0 / max(0.03125, grid_value(pat.step_duration)))))
+        if self.daw.drum_metronome.isChecked() and self.audition_step % beat_steps == 0:
+            self.metronome_click()
+        self.next_audition_time = now + self.step_seconds(self.audition_step)
+        self.daw.sync_drum_panel(runtime_only=True)
+        self.update()
+
+    def keyPressEvent(self, event) -> None:
+        mods = event.modifiers()
+        key = event.key()
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_C:
+            self.copy_selection(); return
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_V:
+            self.paste_selection(); return
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Z:
+            self.undo(); return
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Comma:
+            self.daw.shift_grid(-1); return
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Period:
+            self.daw.shift_grid(1); return
+        if key == Qt.Key.Key_G:
+            self.daw.toggle_grid() if mods & Qt.KeyboardModifier.ShiftModifier else self.daw.toggle_snap(); return
+        if key == Qt.Key.Key_H:
+            self.daw.toggle_ghosts(); return
+        if self.mode == "synth":
+            if key == Qt.Key.Key_BracketLeft:
+                self.daw.shift_length(-1); return
+            if key == Qt.Key.Key_BracketRight:
+                self.daw.shift_length(1); return
+            if key == Qt.Key.Key_Delete:
+                self.delete_selected(); return
+            if key == Qt.Key.Key_Q:
+                self.quantize(); return
+            quick = {Qt.Key.Key_1: "1/4", Qt.Key.Key_2: "1/8", Qt.Key.Key_3: "1/16", Qt.Key.Key_4: "1/32", Qt.Key.Key_5: "1/4T", Qt.Key.Key_6: "1/8T", Qt.Key.Key_7: "1/16T", Qt.Key.Key_8: "1/8D"}
+            if key in quick:
+                self.daw.set_note_length(length_value(quick[key])); return
+        else:
+            if key in (Qt.Key.Key_Delete, Qt.Key.Key_X):
+                self.delete_selected(); return
+            if key == Qt.Key.Key_C and not mods:
+                self.copy_selection(); return
+            if key == Qt.Key.Key_V and not mods:
+                self.paste_selection(); return
+            if key == Qt.Key.Key_Z and not mods:
+                self.undo(); return
+            if key == Qt.Key.Key_M:
+                self.daw.drum_metronome.toggle(); return
+            if key == Qt.Key.Key_S and not mods:
+                self.daw.save_drum_preset(); return
+            if key == Qt.Key.Key_L and not mods:
+                self.daw.load_drum_preset(); return
+            if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                self.daw.shift_step_count(1); return
+            if key == Qt.Key.Key_Minus:
+                self.daw.shift_step_count(-1); return
+        super().keyPressEvent(event)
+
+
+class Nill(QMainWindow):
+    def show_osc(self) -> None:
+        QMessageBox.information(self, "OSC", "Embedded OSC launcher is not bundled in this standalone test build.")
+
+    def show_visualizer(self) -> None:
+        QMessageBox.information(self, "Visualizer", "Embedded visualizer launcher is not bundled in this standalone test build.")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("NILL | Drum Piano Roll Mode")
+        self.resize(1600, 950)
+        self.setMinimumSize(1200, 700)
+
+        self.bpm = 140
+        self.current_grid_label = DEFAULT_GRID
+        self.current_snap = grid_value(self.current_grid_label)
+        self.snap_enabled = True
+        self.show_grid = True
+        self.show_ghost_notes = True
+        self.current_note_length = length_value(DEFAULT_LENGTH)
+
+        self.playing = False
+        self.loop_enabled = False
+        self.loop_start = 0.0
+        self.loop_end = 16.0
+        self.playhead_song_beat = 0.0
+        self._last_playback_time = time.perf_counter()
+        self._last_active_keys: set[str] = set()
+        self._preview_keys: set[str] = set()
+        self.osc_process = None
+        self.visualizer_process = None
+        self._temp_sample_dirs: List[str] = []
+
+        self.samplers: Dict[int, Sampler] = {}
+        self.synth = ChiptuneSynth()
+        self.stream = None
+        self._start_audio()
+
+        self.patterns: List[Pattern] = []
+        self.selected_pattern_index = 0
+        self._build_default_patterns()
+
+        self.playlist_tracks: List[PlaylistTrack] = []
+        self.selected_track_index = 0
+        self._build_default_tracks()
+
+        self._pattern_buttons: List[QPushButton] = []
+        self._build_ui()
+        self._bind_shortcuts()
+        self.sync_ui()
+
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(16)
+        self.playback_timer.timeout.connect(self.update_playback)
+        self.playback_timer.start()
+
+    def _build_default_patterns(self) -> None:
+        defs = [
+            ("Bass", PATTERN_COLORS[3], "saw", [(0, 48, 2), (2, 36, 2), (4, 43, 2), (6, 41, 2)], 8.0),
+            ("Lead", PATTERN_COLORS[4], "square", [(0, 60, 1), (1, 62, 1), (2, 64, 1), (3, 67, 1)], 8.0),
+            ("Chord", PATTERN_COLORS[5], "triangle", [(0, 60, 2), (2, 65, 2), (4, 67, 2), (6, 64, 2)], 8.0),
+            ("Arp", PATTERN_COLORS[6], "triangle", [(0, 72, 0.5), (0.5, 76, 0.5), (1, 79, 0.5), (1.5, 84, 0.5)], 4.0),
+        ]
+        for name, color, wave, notes, length in defs:
+            p = Pattern(name=name, color=color, waveform=wave, length_beats=length)
+            p.mode = "synth"
+            for start, pitch, dur in notes:
+                p.notes.append(Note(pitch=pitch, start=start, duration=dur))
+            self.patterns.append(ensure_pattern(p))
+        drum = Pattern(name="Drums", color=PATTERN_COLORS[0], waveform="noise", length_beats=4.0)
+        drum.mode = "drums"
+        drum.step_count = 16
+        drum.step_duration = "1/16"
+        drum.swing = 0.0
+        drum.drum_samples = []
+        drum.drum_grid = [[0] * 16 for _ in range(8)]
+        self.patterns.append(ensure_pattern(drum))
+
+    def _build_default_tracks(self) -> None:
+        for i in range(8):
+            t = PlaylistTrack(name=f"Track {i+1}", color=PATTERN_COLORS[i % len(PATTERN_COLORS)])
+            t.track_type = "drums" if i == 4 else "synth"
+            self.playlist_tracks.append(ensure_track(t))
+        for t_idx in range(4):
+            pat = self.patterns[t_idx]
+            for bar in range(2):
+                self.playlist_tracks[t_idx].clips.append(PlaylistClip(pattern_index=t_idx, track_index=t_idx, start_beat=bar * pat.length_beats, duration_beats=pat.length_beats))
+
+    def _start_audio(self) -> None:
+        if sd is None:
+            return
+        try:
+            self.stream = sd.OutputStream(samplerate=self.synth.sample_rate, channels=1, blocksize=self.synth.buffer_size, callback=self.audio_callback)
+            self.stream.start()
+        except Exception:
+            self.stream = None
+
+    def audio_callback(self, outdata, frames, time_info, status) -> None:
+        synth_audio = self.synth.generate_audio(frames)
+        drum_audio = np.zeros(frames, dtype=np.float32)
+        for sampler in list(self.samplers.values()):
+            drum_audio += sampler.generate_audio(frames)
+        outdata[:, 0] = np.clip(synth_audio + drum_audio, -0.97, 0.97)
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(6)
+
+        top = QWidget()
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(6)
+        tl.addWidget(QLabel("PATTERN:"))
+        self.pattern_button_host = QWidget()
+        self.pattern_button_layout = QHBoxLayout(self.pattern_button_host)
+        self.pattern_button_layout.setContentsMargins(0, 0, 0, 0)
+        self.pattern_button_layout.setSpacing(4)
+        tl.addWidget(self.pattern_button_host)
+
+        self.play_btn = QPushButton("○")
+        self.play_btn.setCheckable(True)
+        self.play_btn.setObjectName("transportCircle")
+        self.play_btn.setFixedSize(40, 40)
+        self.play_btn.clicked.connect(self.toggle_playback)
+        tl.addWidget(self.play_btn)
+        tl.addWidget(QLabel("SPACE"))
+
+        self.loop_btn = QPushButton("⟲")
+        self.loop_btn.setCheckable(True)
+        self.loop_btn.setFixedSize(36, 36)
+        self.loop_btn.clicked.connect(self.toggle_loop)
+        tl.addWidget(self.loop_btn)
+
+        self.bpm_spin = QSpinBox()
+        self.bpm_spin.setRange(40, 260)
+        self.bpm_spin.setValue(self.bpm)
+        self.bpm_spin.valueChanged.connect(self.on_bpm_changed)
+        tl.addWidget(QLabel("BPM:"))
+        tl.addWidget(self.bpm_spin)
+
+        tl.addWidget(QLabel("Zoom:"))
+        zminus = QPushButton("-")
+        zplus = QPushButton("+")
+        zreset = QPushButton("Reset")
+        zminus.clicked.connect(lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 0.8))
+        zplus.clicked.connect(lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 1.25))
+        zreset.clicked.connect(lambda: self.set_playlist_zoom(1.0))
+        for b in (zminus, zplus):
+            b.setFixedWidth(28)
+        zreset.setFixedWidth(50)
+        tl.addWidget(zminus)
+        tl.addWidget(zreset)
+        tl.addWidget(zplus)
+
+        tl.addWidget(QLabel(">"))
+        self.command_line = QLineEdit()
+        self.command_line.setPlaceholderText("set bpm ___ | show osc | show visualizer")
+        self.command_line.returnPressed.connect(self.run_command_line)
+        self.command_line.setMinimumWidth(240)
+        tl.addWidget(self.command_line, 1)
+
+        tl.addWidget(QLabel("Tracks:"))
+        add_synth = QPushButton("+ Synth")
+        add_drum = QPushButton("+ Drum")
+        add_synth.clicked.connect(lambda: self.add_track("synth"))
+        add_drum.clicked.connect(lambda: self.add_track("drums"))
+        tl.addWidget(add_synth)
+        tl.addWidget(add_drum)
+        outer.addWidget(top)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        outer.addWidget(splitter, 1)
+
+        playlist_box = QWidget()
+        pv = QVBoxLayout(playlist_box)
+        pv.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel("PLAYLIST [ click track header = select mode | double-click clip = edit pattern | right-click clip = delete ]")
+        lbl.setStyleSheet("color:#888; font-size:10px; padding:2px;")
+        pv.addWidget(lbl)
+        self.playlist_scroll = QScrollArea()
+        self.playlist_scroll.setWidgetResizable(True)
+        self.playlist_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.playlist_view = PlaylistView(self)
+        self.playlist_view.pattern_double_clicked.connect(self.on_pattern_double_clicked)
+        self.playlist_scroll.setWidget(self.playlist_view)
+        pv.addWidget(self.playlist_scroll)
+        splitter.addWidget(playlist_box)
+
+        editor_box = QWidget()
+        ev = QVBoxLayout(editor_box)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(6)
+        self.editor_title = QLabel("PIANO ROLL")
+        ev.addWidget(self.editor_title)
+
+        toolbar = QWidget()
+        tv = QHBoxLayout(toolbar)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.setSpacing(6)
+        self.snap_btn = QPushButton("Snap")
+        self.snap_btn.setCheckable(True)
+        self.snap_btn.clicked.connect(self.toggle_snap)
+        tv.addWidget(self.snap_btn)
+        self.grid_combo = QComboBox()
+        for text, value in GRID_OPTIONS:
+            self.grid_combo.addItem(text, value)
+        self.grid_combo.currentIndexChanged.connect(lambda *_: self.set_grid(self.grid_combo.currentData(), self.grid_combo.currentText()))
+        tv.addWidget(QLabel("Grid:"))
+        tv.addWidget(self.grid_combo)
+        self.show_grid_check = QCheckBox("Show Grid")
+        self.show_grid_check.toggled.connect(lambda v: self.set_show_grid(v))
+        tv.addWidget(self.show_grid_check)
+        self.ghost_btn = QPushButton("Ghosts")
+        self.ghost_btn.setCheckable(True)
+        self.ghost_btn.clicked.connect(self.toggle_ghosts)
+        tv.addWidget(self.ghost_btn)
+        self.length_combo = QComboBox()
+        for text, value in LENGTH_OPTIONS:
+            self.length_combo.addItem(text, value)
+        self.length_combo.currentIndexChanged.connect(lambda *_: self.set_note_length(self.length_combo.currentData()))
+        tv.addWidget(QLabel("Length:"))
+        tv.addWidget(self.length_combo)
+        self.length_label = QLabel("")
+        tv.addWidget(self.length_label)
+        self.quantize_btn = QPushButton("Quantize")
+        self.quantize_btn.clicked.connect(self.piano_roll_quantize)
+        tv.addWidget(self.quantize_btn)
+        self.status_label = QLabel("")
+        tv.addWidget(self.status_label, 1)
+        ev.addWidget(toolbar)
+
+        editor_split = QSplitter(Qt.Orientation.Horizontal)
+        self.piano_scroll = QScrollArea()
+        self.piano_scroll.setWidgetResizable(True)
+        self.piano_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.piano_roll = PianoRoll(self)
+        self.piano_scroll.setWidget(self.piano_roll)
+        editor_split.addWidget(self.piano_scroll)
+
+        self.drum_side = QWidget()
+        dv = QVBoxLayout(self.drum_side)
+        dv.setContentsMargins(6, 6, 6, 6)
+        dv.setSpacing(6)
+        dv.addWidget(QLabel("DRUM CONTROLS"))
+        load_btn = QPushButton("Load Samples")
+        load_btn.clicked.connect(self.load_drum_samples)
+        dv.addWidget(load_btn)
+        self.drum_play = QPushButton("Play")
+        self.drum_play.clicked.connect(self.piano_roll.play_audition)
+        dv.addWidget(self.drum_play)
+        stop_btn = QPushButton("Stop")
+        stop_btn.clicked.connect(self.piano_roll.stop_audition)
+        dv.addWidget(stop_btn)
+        self.drum_bpm = QSpinBox()
+        self.drum_bpm.setRange(40, 260)
+        self.drum_bpm.setValue(self.bpm)
+        self.drum_bpm.valueChanged.connect(self.on_bpm_changed)
+        dv.addWidget(QLabel("Tempo / BPM"))
+        dv.addWidget(self.drum_bpm)
+        self.step_count_combo = QComboBox()
+        for n in (16, 32, 64):
+            self.step_count_combo.addItem(str(n), n)
+        self.step_count_combo.currentIndexChanged.connect(self.on_step_count_changed)
+        dv.addWidget(QLabel("Step Count"))
+        dv.addWidget(self.step_count_combo)
+        self.step_duration_combo = QComboBox()
+        for text, value in GRID_OPTIONS:
+            self.step_duration_combo.addItem(text, value)
+        self.step_duration_combo.currentIndexChanged.connect(self.on_step_duration_changed)
+        dv.addWidget(QLabel("Step Duration"))
+        dv.addWidget(self.step_duration_combo)
+        self.swing_spin = QSpinBox()
+        self.swing_spin.setRange(0, 100)
+        self.swing_spin.valueChanged.connect(self.on_swing_changed)
+        dv.addWidget(QLabel("Swing"))
+        dv.addWidget(self.swing_spin)
+        self.drum_metronome = QCheckBox("Metronome")
+        dv.addWidget(self.drum_metronome)
+        self.current_step_label = QLabel("Current Step: -")
+        dv.addWidget(self.current_step_label)
+        save_preset = QPushButton("Save Preset")
+        save_preset.clicked.connect(self.save_drum_preset)
+        load_preset = QPushButton("Load Preset")
+        load_preset.clicked.connect(self.load_drum_preset)
+        dv.addWidget(save_preset)
+        dv.addWidget(load_preset)
+        dv.addStretch(1)
+        editor_split.addWidget(self.drum_side)
+        editor_split.setSizes([1100, 260])
+        ev.addWidget(editor_split, 1)
+        splitter.addWidget(editor_box)
+        splitter.setSizes([520, 360])
+
+        footer = QLabel("G = snap | Shift+G = grid | H = ghosts | [ / ] = note length | Ctrl+, / Ctrl+. = grid resolution")
+        footer.setStyleSheet("color:#9A9A9A; padding:3px;")
+        outer.addWidget(footer)
+
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background: #0A0A0A; color: #E6E6E6; font-family: Consolas, 'Courier New', monospace; font-size: 11px; }
+            QPushButton { background: #1A1A1A; border: 1px solid #444; padding: 5px; border-radius: 4px; }
+            QPushButton:hover { background: #242424; }
+            QPushButton:checked { background: #D9D9D9; color: #080808; border: 1px solid #FFF; }
+            QPushButton#transportCircle { border-radius: 20px; font-size: 22px; font-weight: bold; padding: 0; }
+            QPushButton#transportCircle:checked { background: #E6E6E6; color: #080808; border: 2px solid #FFF; }
+            QScrollArea { border: 1px solid #4A4A4A; background: #050505; }
+            QLineEdit, QComboBox, QSpinBox { background: #141414; border: 1px solid #3F3F3F; padding: 4px; border-radius: 3px; }
+            QCheckBox { spacing: 6px; }
+            QSplitter::handle { background: #333; }
+        """)
+
+        QApplication.instance().installEventFilter(self)
+        self.refresh_pattern_buttons()
+
+    def _bind_shortcuts(self) -> None:
+        items = [
+            ("Ctrl++", lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 1.25)),
+            ("Ctrl+-", lambda: self.set_playlist_zoom(self.playlist_view.zoom_x * 0.8)),
+            ("Ctrl+S", self.save_project),
+            ("Ctrl+O", self.load_project),
+            ("Delete", self.piano_roll.delete_selected),
+        ]
+        for shortcut, slot in items:
+            act = QAction(self)
+            act.setShortcut(shortcut)
+            act.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            act.triggered.connect(slot)
+            self.addAction(act)
+
+    def refresh_pattern_buttons(self) -> None:
+        while self.pattern_button_layout.count():
+            item = self.pattern_button_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._pattern_buttons = []
+        for i, pat in enumerate(self.patterns):
+            btn = QPushButton(f"P{i+1}")
+            btn.setCheckable(True)
+            btn.setFixedWidth(42)
+            btn.setToolTip(f"{pat.name} [{pattern_mode(pat)}]")
+            btn.clicked.connect(lambda checked=False, idx=i: self.set_selected_pattern(idx))
+            self._pattern_buttons.append(btn)
+            self.pattern_button_layout.addWidget(btn)
+        self.pattern_button_layout.addStretch(1)
+
+    def current_pattern(self) -> Pattern:
+        return ensure_pattern(self.patterns[self.selected_pattern_index])
+
+    def current_track(self) -> Optional[PlaylistTrack]:
+        if 0 <= self.selected_track_index < len(self.playlist_tracks):
+            return ensure_track(self.playlist_tracks[self.selected_track_index])
+        return None
+
+    def set_selected_pattern(self, idx: int) -> None:
+        self.selected_pattern_index = max(0, min(len(self.patterns) - 1, idx))
+        for i, btn in enumerate(self._pattern_buttons):
+            btn.blockSignals(True)
+            btn.setChecked(i == self.selected_pattern_index)
+            btn.blockSignals(False)
+        self.sync_ui()
+
+    def select_track(self, idx: int) -> None:
+        self.selected_track_index = max(0, min(len(self.playlist_tracks) - 1, idx))
+        track = self.current_track()
+        if track and pattern_mode(self.current_pattern()) != track.track_type:
+            clip_pattern = next((c.pattern_index for c in track.clips if 0 <= c.pattern_index < len(self.patterns) and pattern_mode(self.patterns[c.pattern_index]) == track.track_type), None)
+            if clip_pattern is None:
+                clip_pattern = next((i for i, p in enumerate(self.patterns) if pattern_mode(p) == track.track_type), None)
+            if clip_pattern is None:
+                clip_pattern = self.create_pattern(track.track_type)
+            self.selected_pattern_index = clip_pattern
+        self.sync_ui()
+
+    def create_pattern(self, mode: str) -> int:
+        color = PATTERN_COLORS[len(self.patterns) % len(PATTERN_COLORS)]
+        if mode == "drums":
+            p = Pattern(name=f"Drums {len(self.patterns)+1}", color=color, waveform="noise", length_beats=4.0)
+            p.mode = "drums"
+            p.step_count = 16
+            p.step_duration = "1/16"
+            p.swing = 0.0
+            p.drum_samples = []
+            p.drum_grid = [[0] * 16 for _ in range(8)]
+        else:
+            p = Pattern(name=f"Pattern {len(self.patterns)+1}", color=color, waveform="square", length_beats=8.0)
+            p.mode = "synth"
+        self.patterns.append(ensure_pattern(p))
+        self.refresh_pattern_buttons()
+        return len(self.patterns) - 1
+
+    def add_track(self, track_type: str = "synth") -> None:
+        idx = len(self.playlist_tracks)
+        t = PlaylistTrack(name=f"Track {idx+1}", color=PATTERN_COLORS[idx % len(PATTERN_COLORS)])
+        t.track_type = track_type
+        self.playlist_tracks.append(ensure_track(t))
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+        self.select_track(idx)
+
+    def set_playlist_zoom(self, zoom: float) -> None:
+        self.playlist_view.zoom_x = max(0.25, min(4.0, zoom))
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+
+    def apply_piano_zoom(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) == "drums":
+            w = int(PianoRoll.DRUM_LIST_W + pat.length_beats * 52 * self.piano_roll.zoom_x) + 80
+            h = int(PianoRoll.HEADER_H + len(pat.drum_grid) * self.piano_roll.drum_row_h()) + 24
+        else:
+            w = int(PianoRoll.KEYBOARD_W + pat.length_beats * 52 * self.piano_roll.zoom_x) + 60
+            h = int(PianoRoll.HEADER_H + (PianoRoll.MAX_MIDI - PianoRoll.MIN_MIDI + 1) * 14 * self.piano_roll.zoom_y) + 20
+        self.piano_roll.setMinimumWidth(max(700, w))
+        self.piano_roll.setMinimumHeight(max(320, h))
+        self.piano_roll.updateGeometry()
+        self.piano_roll.update()
+
+    def sync_ui(self) -> None:
+        pat = self.current_pattern()
+        self.piano_roll.switch_mode(pattern_mode(pat))
+        self.editor_title.setText(f"PIANO ROLL [{pattern_mode(pat).upper()}] - {pat.name}")
+        self.snap_btn.setChecked(self.snap_enabled)
+        self.ghost_btn.setChecked(self.show_ghost_notes)
+        self.show_grid_check.blockSignals(True)
+        self.show_grid_check.setChecked(self.show_grid)
+        self.show_grid_check.blockSignals(False)
+        i = self.grid_combo.findText(self.current_grid_label)
+        if i >= 0:
+            self.grid_combo.blockSignals(True)
+            self.grid_combo.setCurrentIndex(i)
+            self.grid_combo.blockSignals(False)
+        li = self.length_combo.findText(length_label(self.current_note_length))
+        if li >= 0:
+            self.length_combo.blockSignals(True)
+            self.length_combo.setCurrentIndex(li)
+            self.length_combo.blockSignals(False)
+        self.length_label.setText(f"{length_label(self.current_note_length)} ({beats_to_ms(self.current_note_length, self.bpm):.0f}ms @ {self.bpm} BPM)")
+        synth_mode = pattern_mode(pat) == "synth"
+        self.length_combo.setVisible(synth_mode)
+        self.length_label.setVisible(synth_mode)
+        self.quantize_btn.setVisible(synth_mode)
+        self.drum_side.setVisible(not synth_mode)
+        self.sync_drum_panel()
+        self.apply_piano_zoom()
+        self.piano_roll.update_ghosts()
+        self.playlist_view.update()
+        self.piano_roll.update()
+
+    def sync_drum_panel(self, runtime_only: bool = False) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        self.current_step_label.setText(f"Current Step: {self.piano_roll.runtime_step() + 1 if self.piano_roll.runtime_step() >= 0 else '-'}")
+        self.drum_bpm.blockSignals(True)
+        self.drum_bpm.setValue(self.bpm)
+        self.drum_bpm.blockSignals(False)
+        if runtime_only:
+            return
+        self.step_count_combo.blockSignals(True)
+        idx = self.step_count_combo.findData(pat.step_count)
+        if idx >= 0:
+            self.step_count_combo.setCurrentIndex(idx)
+        self.step_count_combo.blockSignals(False)
+        self.step_duration_combo.blockSignals(True)
+        idx = self.step_duration_combo.findText(pat.step_duration)
+        if idx >= 0:
+            self.step_duration_combo.setCurrentIndex(idx)
+        self.step_duration_combo.blockSignals(False)
+        self.swing_spin.blockSignals(True)
+        self.swing_spin.setValue(int(pat.swing * 100))
+        self.swing_spin.blockSignals(False)
+
+    def ensure_pattern_sampler(self, pattern_index: int, force: bool = False) -> Optional[Sampler]:
+        if not (0 <= pattern_index < len(self.patterns)):
+            return None
+        pat = ensure_pattern(self.patterns[pattern_index])
+        if pattern_mode(pat) != "drums":
+            return None
+        sampler = self.samplers.get(pattern_index)
+        if sampler is None:
+            sampler = Sampler(self.synth.sample_rate)
+            self.samplers[pattern_index] = sampler
+            force = True
+        if force or sampler.source_paths != list(pat.drum_samples):
+            sampler.set_samples(list(pat.drum_samples[:16]))
+        return sampler
+
+    def trigger_drum_sample(self, pattern_index: int, sample_index: int, velocity: int) -> None:
+        sampler = self.ensure_pattern_sampler(pattern_index)
+        if sampler:
+            sampler.trigger(sample_index, max(0.0, min(1.0, velocity / 127.0)))
+
+    def sync_clip_durations_for_pattern(self, pattern_index: int) -> None:
+        if not (0 <= pattern_index < len(self.patterns)):
+            return
+        pat = self.patterns[pattern_index]
+        for track in self.playlist_tracks:
+            for clip in track.clips:
+                if clip.pattern_index == pattern_index:
+                    clip.duration_beats = pat.length_beats
+
+    def on_bpm_changed(self, value: int) -> None:
+        self.bpm = int(value)
+        if self.bpm_spin.value() != self.bpm:
+            self.bpm_spin.setValue(self.bpm)
+        if self.drum_bpm.value() != self.bpm:
+            self.drum_bpm.blockSignals(True)
+            self.drum_bpm.setValue(self.bpm)
+            self.drum_bpm.blockSignals(False)
+        self.sync_ui()
+
+    def set_grid(self, value: float, label: str) -> None:
+        self.current_snap = float(value)
+        self.current_grid_label = str(label)
+        self.set_status(f"Snap: {self.current_grid_label}")
+        self.sync_ui()
+
+    def shift_grid(self, delta: int) -> None:
+        idx = self.grid_combo.currentIndex()
+        self.grid_combo.setCurrentIndex(max(0, min(self.grid_combo.count() - 1, idx + delta)))
+
+    def set_note_length(self, value: float) -> None:
+        self.current_note_length = float(value)
+        self.sync_ui()
+
+    def shift_length(self, delta: int) -> None:
+        idx = self.length_combo.currentIndex()
+        self.length_combo.setCurrentIndex(max(0, min(self.length_combo.count() - 1, idx + delta)))
+
+    def toggle_snap(self) -> None:
+        self.snap_enabled = not self.snap_enabled
+        self.sync_ui()
+
+    def toggle_grid(self) -> None:
+        self.show_grid = not self.show_grid
+        self.sync_ui()
+
+    def set_show_grid(self, value: bool) -> None:
+        self.show_grid = bool(value)
+        self.sync_ui()
+
+    def toggle_ghosts(self) -> None:
+        self.show_ghost_notes = not self.show_ghost_notes
+        self.sync_ui()
+
+    def on_step_count_changed(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        self.piano_roll.push_undo()
+        pat.step_count = int(self.step_count_combo.currentData())
+        ensure_pattern(pat)
+        self.sync_clip_durations_for_pattern(self.selected_pattern_index)
+        self.sync_ui()
+
+    def shift_step_count(self, delta: int) -> None:
+        idx = self.step_count_combo.currentIndex()
+        self.step_count_combo.setCurrentIndex(max(0, min(self.step_count_combo.count() - 1, idx + delta)))
+
+    def on_step_duration_changed(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        self.piano_roll.push_undo()
+        pat.step_duration = self.step_duration_combo.currentText()
+        ensure_pattern(pat)
+        self.sync_clip_durations_for_pattern(self.selected_pattern_index)
+        self.sync_ui()
+
+    def on_swing_changed(self, value: int) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        pat.swing = max(0.0, min(1.0, value / 100.0))
+        self.sync_ui()
+
+    def piano_roll_quantize(self) -> None:
+        self.piano_roll.quantize()
+
+    def toggle_playback(self) -> None:
+        if self.playing:
+            self.stop_playback()
+            return
+        self.playing = True
+        self._last_playback_time = time.perf_counter()
+        self.update_transport()
+
+    def toggle_loop(self) -> None:
+        self.loop_enabled = not self.loop_enabled
+        self.loop_btn.setChecked(self.loop_enabled)
+        self.playlist_view.update()
+
+    def stop_playback(self) -> None:
+        self.playing = False
+        self.playhead_song_beat = 0.0
+        self._last_playback_time = time.perf_counter()
+        self._release_all()
+        self.update_transport()
+        self.playlist_view.update()
+        self.piano_roll.update()
+
+    def _release_all(self) -> None:
+        for key in list(self._last_active_keys):
+            if key.startswith("s:"):
+                self.synth.note_off(key)
+        self._last_active_keys.clear()
+
+    def update_transport(self) -> None:
+        self.play_btn.blockSignals(True)
+        self.play_btn.setChecked(self.playing)
+        self.play_btn.setText("●" if self.playing else "○")
+        self.play_btn.blockSignals(False)
+
+    def _collect_active(self) -> Dict[str, tuple]:
+        beat = self.playhead_song_beat
+        active: Dict[str, tuple] = {}
+        any_solo = any(getattr(t, "solo", False) for t in self.playlist_tracks)
+        for t_idx, track in enumerate(self.playlist_tracks):
+            ensure_track(track)
+            if track.muted:
+                continue
+            if any_solo and not track.solo:
+                continue
+            for c_idx, clip in enumerate(track.clips):
+                if clip.muted or not (clip.start_beat <= beat < clip.start_beat + clip.duration_beats):
+                    continue
+                pat = ensure_pattern(self.patterns[clip.pattern_index])
+                local = (beat - clip.start_beat) % max(0.0001, pat.length_beats)
+                if pattern_mode(pat) == "drums":
+                    step_beats = grid_value(pat.step_duration)
+                    step = max(0, min(pat.step_count - 1, int(local / step_beats)))
+                    for row, row_data in enumerate(pat.drum_grid):
+                        vel = int(row_data[step])
+                        if vel > 0:
+                            active[f"d:{t_idx}:{c_idx}:{row}:{step}"] = ("drum", clip.pattern_index, row, vel)
+                else:
+                    for n_idx, note in enumerate(pat.notes):
+                        if not note.muted and note.start <= local < note.start + note.duration:
+                            active[f"s:{t_idx}:{c_idx}:{n_idx}"] = ("synth", pat, note)
+        return active
+
+    def update_playback(self) -> None:
+        now = time.perf_counter()
+        if not self.playing:
+            self._last_playback_time = now
+            self.sync_drum_panel(runtime_only=True)
+            return
+        delta = now - self._last_playback_time
+        self._last_playback_time = now
+        self.playhead_song_beat += delta * (self.bpm / 60.0)
+        if self.loop_enabled and self.loop_end > self.loop_start and self.playhead_song_beat >= self.loop_end:
+            self.playhead_song_beat = self.loop_start + (self.playhead_song_beat - self.loop_end) % (self.loop_end - self.loop_start)
+            self._release_all()
+
+        active = self._collect_active()
+        active_keys = set(active.keys())
+        for key in self._last_active_keys - active_keys:
+            if key.startswith("s:"):
+                self.synth.note_off(key)
+        for key in active_keys - self._last_active_keys:
+            data = active[key]
+            if data[0] == "drum":
+                _, pat_idx, row, vel = data
+                self.trigger_drum_sample(pat_idx, row, vel)
+            else:
+                _, pat, note = data
+                self.synth.note_on(key, note.pitch, velocity=max(0.0, min(1.0, note.velocity / 127.0)), waveform=pat.waveform, gain=pat.gain)
+        self._last_active_keys = active_keys
+        self.playlist_view.update()
+        self.piano_roll.update()
+        self.sync_drum_panel(runtime_only=True)
+
+    def preview_note_on(self, key: str, pitch: int) -> None:
+        self._preview_keys.add(key)
+        pat = self.current_pattern()
+        self.synth.note_on(key, pitch, velocity=0.9, waveform=pat.waveform, gain=min(1.0, pat.gain))
+
+    def preview_note_off(self, key: str) -> None:
+        if key in self._preview_keys:
+            self.synth.note_off(key)
+            self._preview_keys.discard(key)
+
+    def _cleanup_temp_sample_dirs(self) -> None:
+        for folder in self._temp_sample_dirs:
+            try:
+                shutil.rmtree(folder, ignore_errors=True)
+            except Exception:
+                pass
+        self._temp_sample_dirs.clear()
+
+    def _extract_samples_from_zip(self, zip_path: str) -> List[str]:
+        audio_exts = {".wav", ".mp3", ".ogg", ".flac"}
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            audio_names = [
+                name for name in zf.namelist()
+                if not name.endswith("/") and Path(name).suffix.lower() in audio_exts
+            ]
+            audio_names.sort(key=lambda name: (Path(name).suffix.lower(), Path(name).name.lower()))
+            if not audio_names:
+                raise ValueError("No audio files found in ZIP file.")
+
+            temp_dir = tempfile.mkdtemp(prefix="nill_drum_zip_")
+            self._temp_sample_dirs.append(temp_dir)
+            extracted: List[str] = []
+            for idx, name in enumerate(audio_names[:16]):
+                suffix = Path(name).suffix.lower()
+                stem = Path(name).stem or f"sample_{idx+1}"
+                safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in stem)
+                target = Path(temp_dir) / f"{idx:02d}_{safe_name}{suffix}"
+                with zf.open(name) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted.append(str(target))
+        return extracted
+
+    def load_drum_samples(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Load Drum Samples or ZIP Kit",
+            str(Path.home()),
+            "Audio / Drum Pack (*.wav *.mp3 *.ogg *.flac *.zip);;ZIP Drum Pack (*.zip);;Audio Files (*.wav *.mp3 *.ogg *.flac)",
+        )
+        if not paths:
+            return
+
+        audio_exts = {".wav", ".mp3", ".ogg", ".flac"}
+        resolved: List[str] = []
+        zip_count = 0
+        for source in paths:
+            suffix = Path(source).suffix.lower()
+            if suffix == ".zip":
+                try:
+                    extracted = self._extract_samples_from_zip(source)
+                except Exception as exc:
+                    QMessageBox.warning(self, "Load Drum ZIP", f"Failed to import ZIP:\n{source}\n\n{exc}")
+                    continue
+                resolved.extend(extracted)
+                zip_count += 1
+            elif suffix in audio_exts:
+                resolved.append(source)
+            if len(resolved) >= 16:
+                break
+
+        resolved = resolved[:16]
+        if not resolved:
+            QMessageBox.warning(self, "Load Drum Samples", "No valid drum samples were loaded.")
+            return
+
+        pat.drum_samples = resolved
+        ensure_pattern(pat)
+        self.ensure_pattern_sampler(self.selected_pattern_index, force=True)
+        self.sync_ui()
+        source_label = "ZIP kit" if zip_count == 1 and len(paths) == 1 and Path(paths[0]).suffix.lower() == ".zip" else "selection"
+        self.set_status(f"Loaded {len(resolved)} drum samples from {source_label}")
+
+    def save_drum_preset(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Drum Preset", str(Path.home() / "drum_preset.json"), "Drum Preset (*.json)")
+        if not path:
+            return
+        data = {"name": pat.name, "steps": pat.step_count, "bpm": self.bpm, "swing": pat.swing, "step_duration": pat.step_duration, "samples": list(pat.drum_samples), "grid": [list(row) for row in pat.drum_grid]}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+
+    def load_drum_preset(self) -> None:
+        pat = self.current_pattern()
+        if pattern_mode(pat) != "drums":
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load Drum Preset", str(Path.home()), "Drum Preset (*.json)")
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        pat.name = str(data.get("name", pat.name))
+        pat.step_count = int(data.get("steps", 16))
+        pat.step_duration = str(data.get("step_duration", "1/16"))
+        pat.swing = float(data.get("swing", 0.0))
+        pat.drum_samples = [str(p) for p in data.get("samples", [])]
+        pat.drum_grid = [[int(v) for v in row] for row in data.get("grid", [])]
+        ensure_pattern(pat)
+        self.ensure_pattern_sampler(self.selected_pattern_index, force=True)
+        self.sync_clip_durations_for_pattern(self.selected_pattern_index)
+        self.sync_ui()
+
+    def on_pattern_double_clicked(self, pattern_index: int) -> None:
+        self.set_selected_pattern(pattern_index)
+
+    def show_track_context_menu(self, track_idx: int, global_pos) -> None:
+        menu = QMenu(self)
+        track = ensure_track(self.playlist_tracks[track_idx])
+        menu.addAction("Mute" if not track.muted else "Unmute").triggered.connect(lambda: self.toggle_track_mute(track_idx))
+        menu.addAction("Solo" if not track.solo else "Unsolo").triggered.connect(lambda: self.toggle_track_solo(track_idx))
+        menu.addSeparator()
+        menu.addAction("Convert to Synth Track").triggered.connect(lambda: self.set_track_type(track_idx, "synth"))
+        menu.addAction("Convert to Drum Track").triggered.connect(lambda: self.set_track_type(track_idx, "drums"))
+        menu.addSeparator()
+        menu.addAction("Delete Track").triggered.connect(lambda: self.delete_track(track_idx))
+        menu.exec(global_pos)
+
+    def set_track_type(self, idx: int, track_type: str) -> None:
+        self.playlist_tracks[idx].track_type = track_type
+        self.select_track(idx)
+
+    def toggle_track_mute(self, idx: int) -> None:
+        self.playlist_tracks[idx].muted = not self.playlist_tracks[idx].muted
+        self.playlist_view.update()
+
+    def toggle_track_solo(self, idx: int) -> None:
+        self.playlist_tracks[idx].solo = not self.playlist_tracks[idx].solo
+        self.playlist_view.update()
+
+    def delete_track(self, idx: int) -> None:
+        if len(self.playlist_tracks) <= 1:
+            return
+        self.playlist_tracks.pop(idx)
+        for t_i, track in enumerate(self.playlist_tracks):
+            for clip in track.clips:
+                clip.track_index = t_i
+        self.selected_track_index = max(0, min(self.selected_track_index, len(self.playlist_tracks) - 1))
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+        self.sync_ui()
+
+    def project_data(self) -> dict:
+        return {
+            "app": "Nill Drum Mode",
+            "version": 7,
+            "bpm": self.bpm,
+            "snap": self.current_snap,
+            "snap_label": self.current_grid_label,
+            "snap_enabled": self.snap_enabled,
+            "show_grid": self.show_grid,
+            "show_ghost_notes": self.show_ghost_notes,
+            "note_length": self.current_note_length,
+            "loop_enabled": self.loop_enabled,
+            "loop_start": self.loop_start,
+            "loop_end": self.loop_end,
+            "selected_track": self.selected_track_index,
+            "patterns": [pattern_to_dict(p) for p in self.patterns],
+            "tracks": [track_to_dict(t) for t in self.playlist_tracks],
+        }
+
+    def save_project(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save Nill Project", str(Path.home() / "nill_project.json"), "Nill Project (*.json)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(self.project_data(), fh, indent=2)
+
+    def load_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Nill Project", str(Path.home()), "Nill Project (*.json)")
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.stop_playback()
+        self.bpm = int(data.get("bpm", 140))
+        self.current_snap = float(data.get("snap", grid_value(DEFAULT_GRID)))
+        self.current_grid_label = str(data.get("snap_label", grid_label(self.current_snap)))
+        self.snap_enabled = bool(data.get("snap_enabled", True))
+        self.show_grid = bool(data.get("show_grid", True))
+        self.show_ghost_notes = bool(data.get("show_ghost_notes", True))
+        self.current_note_length = float(data.get("note_length", length_value(DEFAULT_LENGTH)))
+        self.loop_enabled = bool(data.get("loop_enabled", False))
+        self.loop_start = float(data.get("loop_start", 0.0))
+        self.loop_end = float(data.get("loop_end", 16.0))
+        self.patterns = [pattern_from_dict(p) for p in data.get("patterns", [])]
+        self.playlist_tracks = [track_from_dict(t) for t in data.get("tracks", [])]
+        self.selected_track_index = int(data.get("selected_track", 0))
+        self.samplers.clear()
+        self.refresh_pattern_buttons()
+        self.select_track(self.selected_track_index)
+        self.bpm_spin.setValue(self.bpm)
+        self.loop_btn.setChecked(self.loop_enabled)
+        self.playlist_view.updateGeometry()
+        self.playlist_view.update()
+        self.sync_ui()
+
+    def run_command_line(self) -> None:
+        raw = self.command_line.text().strip()
+        command = " ".join(raw.lower().split())
+        if not command:
+            return
+        if command.startswith("set bpm "):
+            try:
+                bpm = int(command.removeprefix("set bpm ").strip())
+            except ValueError:
+                QMessageBox.warning(self, "Command", "Use: set bpm ___")
+                return
+            if not (40 <= bpm <= 260):
+                QMessageBox.warning(self, "Command", "BPM must be 40–260.")
+                return
+            self.bpm_spin.setValue(bpm)
+            self.command_line.clear()
+            return
+        if command == "show osc":
+            self.command_line.clear(); self.show_osc(); return
+        if command == "show visualizer":
+            self.command_line.clear(); self.show_visualizer(); return
+        QMessageBox.warning(self, "Command", "Allowed commands:\nset bpm ___\nshow osc\nshow visualizer")
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
+            if self.command_line.hasFocus():
+                return False
+            focus = QApplication.focusWidget()
+            if self.piano_roll.hasFocus() or (focus and self.drum_side.isAncestorOf(focus)):
+                if self.piano_roll.handle_spacebar():
+                    return True
+            self.toggle_playback()
+            return True
+        return super().eventFilter(watched, event)
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+        QTimer.singleShot(1200, lambda: self.status_label.clear() if self.status_label.text() == text else None)
+
+    def closeEvent(self, event) -> None:
+        self.piano_roll.stop_audition()
+        self.stop_playback()
+        self.synth.all_notes_off()
+        for proc in [self.visualizer_process, self.osc_process]:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        if self.stream:
+            try:
+                self.stream.stop(); self.stream.close()
+            except Exception:
+                pass
+        self._cleanup_temp_sample_dirs()
+        super().closeEvent(event)
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    win = Nill()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
