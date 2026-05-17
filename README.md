@@ -5,4 +5,4 @@ system Identifiers in the UI:
 
 window title: NODE_0x7F // PARANOIA_UI
 sidebar header: SYSTEM_ROOT
-background noise: Constant "schizo" scrolling of a poem in extremely faint, dark text.
+simple distored ASCII art saying:"PARANOID"
