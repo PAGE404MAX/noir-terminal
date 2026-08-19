@@ -2543,7 +2543,9 @@ class SerumApp:
         sec = tk.Frame(parent, bg=BG_BLACK); sec.pack(fill='x', padx=12, pady=10)
         label(sec, '[GLOBAL WAVEFORM]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0,6))
         label(sec, 'M=Next N=Prev (overrides OSC)', size=7, color=FG_DIM).pack(anchor='w', pady=(0,8))
-        bf = tk.Frame(sec, bg=BG_BLACK); bf.pac_waveform_selector(self, parent):
+        bf = tk.Frame(sec, bg=BG_BLACK); bf.pack(fill='x')
+
+    def _build_waveform_selector(self, parent):
         sep(parent).pack(fill='x')
         sec = tk.Frame(parent, bg=BG_BLACK); sec.pack(fill='x', padx=12, pady=10)
         label(sec, '[GLOBAL WAVEFORM]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0,6))
