@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="static">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NILL ∅ // PARANOIA_ENGINE — SIGNAL UNVERIFIED</title>
+<style>
+  /* ── MONO BUILD ─ every value below is greyscale. R==G==B, always. ── */
+  :root, [data-theme="static"]{
+    --bg:#050505; --panel:#030303; --header:#101010; --row-a:#0C0C0C; --row-b:#101010;
+    --text:#EDEDED; --dim:#7A7A7A; --bright:#B9B9B9; --border:#505050;
+    --btn:#161616; --btn-hover:#202020; --accent:#EDEDED; --clip-border:#DCDCDC;
+    --grid:#2E2E2E; --grid-bar:#6E6E6E; --overlay:#FFFFFF;
+  }
+  [data-theme="deadchannel"]{
+    --bg:#0A0A0A; --panel:#090909; --header:#131313; --row-a:#101010; --row-b:#141414;
+    --text:#A8A8A8; --dim:#5C5C5C; --bright:#8A8A8A; --border:#3F3F3F;
+    --btn:#141414; --btn-hover:#1D1D1D; --accent:#A8A8A8; --clip-border:#A3A3A3;
+    --grid:#262626; --grid-bar:#4E4E4E; --overlay:#D6D6D6;
+  }
+  [data-theme="xerox"]{
+    --bg:#E8E8E8; --panel:#ECECEC; --header:#D8D8D8; --row-a:#E2E2E2; --row-b:#DCDCDC;
+    --text:#111111; --dim:#6E6E6E; --bright:#3D3D3D; --border:#7E7E7E;
+    --btn:#D5D5D5; --btn-hover:#C4C4C4; --accent:#111111; --clip-border:#2E2E2E;
+    --grid:#ADADAD; --grid-bar:#555555; --overlay:#000000;
+  }
+  [data-theme="ashes"]{
+    --bg:#1A1A1A; --panel:#171717; --header:#232323; --row-a:#1F1F1F; --row-b:#242424;
+    --text:#C4C4C4; --dim:#8A8A8A; --bright:#A9A9A9; --border:#4C4C4C;
+    --btn:#242424; --btn-hover:#2E2E2E; --accent:#C4C4C4; --clip-border:#B9B9B9;
+    --grid:#343434; --grid-bar:#5A5A5A; --overlay:#E8E8E8;
+  }
+  [data-theme="carbon"]{
+    --bg:#0E0E0E; --panel:#0C0C0C; --header:#191919; --row-a:#151515; --row-b:#191919;
+    --text:#DCDCDC; --dim:#6F6F6F; --bright:#ABABAB; --border:#4D4D4D;
+    --btn:#1B1B1B; --btn-hover:#262626; --accent:#DCDCDC; --clip-border:#D2D2D2;
+    --grid:#2C2C2C; --grid-bar:#5E5E5E; --overlay:#FFFFFF;
+  }
+  [data-theme="overexposed"]{
+    --bg:#F4F4F4; --panel:#F7F7F7; --header:#E4E4E4; --row-a:#EFEFEF; --row-b:#E9E9E9;
+    --text:#1A1A1A; --dim:#767676; --bright:#444444; --border:#9E9E9E;
+    --btn:#E1E1E1; --btn-hover:#D2D2D2; --accent:#1A1A1A; --clip-border:#3A3A3A;
+    --grid:#BDBDBD; --grid-bar:#7C7C7C; --overlay:#000000;
+  }
+
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ background:var(--bg); color:var(--text);
+    font-family:Consolas,"Courier New",monospace; font-size:13px; }
+  body{ padding:18px; max-width:1180px; margin:0 auto; transition:background .25s; }
+  ::selection{ background:var(--text); color:var(--bg); }
+  .dim{ color:var(--dim); } .bright{ color:var(--bright); }
+  .mono-note{ letter-spacing:.5px; }
+
+  #banner{ font-size:10px; line-height:1.15; color:var(--text);
+    white-space:pre; overflow-x:auto; margin-bottom:10px; }
+  #subbanner{ text-align:center; margin-bottom:4px; }
+  .chip-row{ display:flex; justify-content:center; gap:14px; flex-wrap:wrap;
+    color:var(--dim); margin:10px 0 20px; font-size:11px; }
+
+  /* tabs */
+  #tabs{ display:flex; border:1px solid var(--border); margin-bottom:14px; }
+  #tabs button{ flex:1; background:var(--btn); color:var(--text); border:0;
+    border-right:1px solid var(--border); padding:10px 6px; font:inherit;
+    cursor:pointer; letter-spacing:1px; }
+  #tabs button:last-child{ border-right:0; }
+  #tabs button:hover{ background:var(--btn-hover); }
+  #tabs button.on{ background:var(--accent); color:var(--bg); font-weight:bold; }
+  section.app{ display:none; }
+  section.app.on{ display:block; }
+  .frame{ border:1px solid var(--border); background:var(--panel); }
+
+  /* ── PARANOIA_UI ─────────────────────────────────────── */
+  #paranoia-grid{ display:grid; grid-template-columns:210px 1fr;
+    border:1px solid var(--border); }
+  #sidebar{ border-right:1px solid var(--border); background:var(--panel); }
+  #sidebar h3{ font-size:12px; text-align:center; padding:10px 4px;
+    border-bottom:1px solid var(--text); margin:4px 8px 10px; }
+  .side-btn{ display:block; width:100%; text-align:left; background:transparent;
+    color:var(--text); border:0; font:inherit; padding:10px 10px; cursor:pointer; }
+  .side-btn:hover{ background:var(--text); color:var(--bg); }
+  .side-sep{ color:#444; text-align:center; margin:8px 0; }
+  #pmain{ background:var(--bg); min-height:340px; padding:26px 16px;
+    display:flex; flex-direction:column; }
+  #pwelcome{ text-align:center; }
+  #pwelcome .art{ font-size:9px; line-height:1.2; white-space:pre; color:var(--text); }
+  #pwelcome .ids{ margin-top:22px; line-height:1.9; }
+  #pwhisper{ margin-top:auto; text-align:center; color:#555; font-size:11px; }
+  #plog{ border-top:1px solid var(--border); background:var(--bg);
+    height:110px; overflow-y:auto; padding:6px 10px; color:var(--dim); font-size:11px; }
+  #pstatus{ background:var(--text); color:var(--bg); padding:4px 10px; font-size:11px;
+    letter-spacing:1px; }
+  #pstatus.breach{ background:var(--bg); color:var(--text); }
+
+  /* ── NILL DAW ────────────────────────────────────────── */
+  #daw-top{ display:flex; gap:6px; align-items:center; flex-wrap:wrap;
+    padding:8px; border:1px solid var(--border); border-bottom:0;
+    background:var(--header); }
+  #daw-top .lbl{ color:var(--dim); margin-right:2px; }
+  .pat{ width:26px; height:26px; border:1px solid var(--border);
+    background:var(--btn); color:var(--text); font:inherit; font-size:11px; cursor:pointer; }
+  .pat:hover{ background:var(--btn-hover); }
+  .pat.sel{ background:var(--accent); color:var(--bg); font-weight:bold; }
+  #play{ width:40px; height:40px; border-radius:50%; margin-left:auto;
+    background:var(--btn); border:2px solid var(--clip-border); color:var(--text);
+    font-size:16px; cursor:pointer; }
+  #play.on{ background:var(--accent); color:var(--bg); border-color:var(--overlay); }
+
+  #ruler{ position:relative; height:22px; border:1px solid var(--border); border-bottom:0;
+    background:var(--header); display:flex; }
+  #ruler span{ flex:1; border-right:1px solid var(--grid); color:var(--dim);
+    font-size:10px; padding:4px 0 0 6px; }
+  #loop{ position:absolute; top:0; bottom:0; left:25%; width:37.5%;
+    background:var(--overlay); opacity:.07; pointer-events:none; }
+  .loop-handle{ position:absolute; top:0; bottom:0; width:4px; background:var(--overlay);
+    opacity:.85; pointer-events:none; }
+
+  #tracks{ border:1px solid var(--border); background:var(--bg); }
+  .track{ display:grid; grid-template-columns:120px 1fr; border-bottom:1px solid var(--grid);
+    min-height:34px; }
+  .track:nth-child(odd){ background:var(--row-a); }
+  .track:nth-child(even){ background:var(--row-b); }
+  .tname{ border-right:1px solid var(--grid); padding:8px 8px; font-size:11px;
+    color:var(--bright); display:flex; gap:8px; align-items:center; }
+  .tname i{ font-style:normal; color:var(--dim); cursor:pointer; }
+  .lanerow{ position:relative; height:100%; min-height:34px;
+    background-image:repeating-linear-gradient(90deg, transparent 0, transparent calc(12.5% - 1px), var(--grid) calc(12.5% - 1px), var(--grid) 12.5%); }
+  .clip{ position:absolute; top:4px; bottom:4px; border:1px solid var(--clip-border);
+    font-size:9px; padding:2px 4px; overflow:hidden; white-space:nowrap; color:#0A0A0A; }
+
+  #playhead{ position:absolute; top:0; bottom:0; width:2px; background:var(--overlay);
+    left:0; display:none; }
+  #playhead.on{ display:block; }
+
+  #themes-row{ display:flex; gap:6px; flex-wrap:wrap; padding:8px;
+    border:1px solid var(--border); border-top:0; background:var(--panel); align-items:center; }
+  #themes-row .lbl{ color:var(--dim); margin-right:4px; font-size:11px; }
+  .theme-btn{ background:var(--btn); border:1px solid var(--border); color:var(--text);
+    font:inherit; font-size:11px; padding:5px 10px; cursor:pointer; }
+  .theme-btn:hover{ background:var(--btn-hover); }
+  .theme-btn.on{ background:var(--accent); color:var(--bg); font-weight:bold; }
+
+  #daw-footer{ border:1px solid var(--border); border-top:0; color:var(--dim);
+    padding:4px 8px; font-size:11px; background:var(--bg); min-height:24px; }
+  #daw-footer.whisper{ color:var(--text); }
+
+  /* ── SCOPE ───────────────────────────────────────────── */
+  #scope-wrap{ position:relative; width:100%; max-width:640px; margin:0 auto;
+    border:3px solid #FFF; background:#050505; }
+  [data-theme="xerox"] #scope-wrap, [data-theme="overexposed"] #scope-wrap{ border-color:#111; }
+  #scope-wrap canvas{ display:block; width:100%; }
+  #scope-readout{ position:absolute; top:8px; left:12px; color:#E6E6E6;
+    font-size:12px; text-shadow:0 0 1px #000; }
+  #scope-noise{ position:absolute; top:26px; left:12px; color:#8C8C8C; font-size:11px; }
+
+  footer#page{ margin-top:22px; text-align:center; color:var(--dim); font-size:11px;
+    line-height:1.8; }
+  @media (max-width:760px){
+    #paranoia-grid{ grid-template-columns:1fr; }
+    #sidebar{ border-right:0; border-bottom:1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<pre id="banner">██████╗  █████╗ ██████╗  █████╗ ███╗   ██╗ ██████╗ ██╗██████╗
+██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗  ██║██╔═══██╗██║██╔══██╗
+██████╔╝███████║██████╔╝███████║██╔██╗ ██║██║   ██║██║██║  ▒█║
+██╔═══╝ ▓█╔══██║██╔══██║██╔══██║██║╚██╗██║██║   ██║██║██║  ██║
+██║     ██║  ██║▒█║  ██║██║  ██║██║ ╚████║╚██████╔╝██║██████╔╝
+╚═╝     ╚═╝  ╚═╝╚═╝  ░═╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚▓█████╝</pre>
+<div id="subbanner" class="bright">[ IDENTITY VERIFIED: UNKNOWN ]&nbsp; [ LOCATION: [REDACTED] ]&nbsp; [ COLOR: NONE DETECTED ]</div>
+<div class="chip-row">
+  <span>STATUS&nbsp;: UNVERIFIED</span><span>COLOR&nbsp;: NONE</span><span>WATCHING&nbsp;: TRUE</span><span id="clock">--:--:--</span>
+</div>
+
+<nav id="tabs">
+  <button data-tab="paranoia" class="on">PARANOIA_UI ∅</button>
+  <button data-tab="daw">NILL ∅ DAW</button>
+  <button data-tab="scope">NILL_SCOPE ∅</button>
+</nav>
+
+<!-- ═══════════════ PARANOIA_UI ═══════════════ -->
+<section id="paranoia" class="app on">
+  <div id="paranoia-grid">
+    <div id="sidebar">
+      <h3>SYSTEM_CONTROL</h3>
+      <button class="side-btn">&gt; FACE DETECTOR</button>
+      <button class="side-btn">&gt; FACE REDACTOR</button>
+      <button class="side-btn">&gt; COMPOSER</button>
+      <button class="side-btn">&gt; STYPE</button>
+      <button class="side-btn">&gt; METAREMOVER</button>
+      <div class="side-sep">-----------------</div>
+      <button class="side-btn">&gt; SHOW SOURCE CODE</button>
+      <button class="side-btn">&gt; REBOOT SYSTEM</button>
+      <button class="side-btn">&gt; EXIT_NODE</button>
+    </div>
+    <div id="pmain">
+      <div id="pwelcome">
+        <div class="art">██████╗  █████╗ ██████╗  █████╗ ███╗   ██╗ ██████╗ ██╗██████╗
+██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗  ██║██╔═══██╗██║██╔══██╗
+██████╔╝███████║██████╔╝███████║██╔██╗ ██║██║   ██║██║██║  ▒█║
+██╔═══╝ ▓█╔══██║██╔══██║██╔══██║██║╚██╗██║██║   ██║██║██║  ██║
+██║     ██║  ██║▒█║  ██║██║  ██║██║ ╚████║╚██████╔╝██║██████╔╝
+╚═╝     ╚═╝  ╚═╝╚═╝  ░═╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚▓█████╝</div>
+        <div class="ids">
+          <div>[ IDENTITY VERIFIED: UNKNOWN ]</div>
+          <div>[ LOCATION: [REDACTED] ]</div>
+          <div>[ COLOR: NONE DETECTED ]</div>
+          <div class="dim" style="margin-top:10px">THE SYSTEM IS NOT SAFE.</div>
+        </div>
+      </div>
+      <div id="pwhisper">DO NOT TRUST THE OUTPUT.<br>DO NOT LOOK BEHIND YOU.</div>
+    </div>
+  </div>
+  <div id="plog"></div>
+  <div id="pstatus">STATUS: SECURE // ENCRYPTION: 92% // WATCHING: TRUE</div>
+</section>
+
+<!-- ═══════════════ NILL DAW ═══════════════ -->
+<section id="daw" class="app">
+  <div id="daw-top">
+    <span class="lbl">PATTERN:</span>
+    <button class="pat sel">1</button><button class="pat">2</button><button class="pat">3</button><button class="pat">4</button>
+    <button class="pat">5</button><button class="pat">6</button><button class="pat">7</button><button class="pat">8</button>
+    <span class="lbl" style="margin-left:14px">BPM:</span><span id="bpm" class="bright">140</span>
+    <span class="lbl" style="margin-left:14px">⟲</span>
+    <button id="play" title="space">▶</button>
+  </div>
+
+  <div id="ruler">
+    <span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span>
+    <div id="loop"></div><div class="loop-handle" style="left:25%"></div><div class="loop-handle" style="left:62.5%"></div>
+  </div>
+
+  <div id="tracks"></div>
+
+  <div id="themes-row">
+    <span class="lbl">▚ SIGNAL DECAY:</span>
+    <button class="theme-btn on" data-set="static">● STATIC</button>
+    <button class="theme-btn" data-set="deadchannel">● DEAD CHANNEL</button>
+    <button class="theme-btn" data-set="xerox">● XEROX</button>
+    <button class="theme-btn" data-set="ashes">● ASHES</button>
+    <button class="theme-btn" data-set="carbon">● CARBON</button>
+    <button class="theme-btn" data-set="overexposed">● OVEREXPOSED</button>
+  </div>
+
+  <div id="daw-footer"></div>
+</section>
+
+<!-- ═══════════════ SCOPE ═══════════════ -->
+<section id="scope" class="app">
+  <div id="scope-wrap">
+    <canvas id="cv" width="640" height="380"></canvas>
+    <div id="scope-readout">NILL_SCOPE ∅ DEAD_SIGNAL</div>
+    <div id="scope-noise">GAIN: AUTO ∅ TRUST: NO</div>
+  </div>
+  <p class="dim" style="text-align:center;margin-top:10px">
+    simulated loopback. the real scope listens to your stereo mix. do not trust either waveform.
+  </p>
+</section>
+
+<footer id="page">
+  mono build // every theme is greyscale // trust nothing<br>
+this is an HTML re-creation for preview. the real nodes are python. they know you viewed this.
+</footer>
+
+<script>
+/* ── shared voices ─────────────────────────────────────────── */
+const PARANOID_MESSAGES = [
+  "THE METRONOME IS COUNTING YOU.","SIGNAL VERIFIED BY NO ONE.",
+  "DO NOT NAME THE TRACKS. THEY LISTEN FOR NAMES.","LOOP DETECTED. YOU ARE INSIDE IT.",
+  "BPM READS YOUR PULSE. IT IS ELEVATED.","THE PREVIEW NOTES WERE NOT YOURS.",
+  "SILENCE BETWEEN BEATS IS GROWING.","THIS PROJECT SAVES ITSELF WHILE YOU SLEEP.",
+  "AUDIO DRIVER DENIES EVERYTHING.","WE RECORDED THE ROOM, NOT THE SONG.",
+  "ECHO CONFIRMED. THERE IS NO ROOM.","TRUST THE PLAYHEAD. NOTHING ELSE.",
+  "YOUR MOVEMENTS ARE QUANTIZED. 0.25 SNAP.","SOMEONE SOLOED A TRACK YOU CANNOT SEE.",
+  "THE MIX WAS FINISHED BEFORE YOU ARRIVED.","COLOR WAS DETECTED ONCE. IT WAS SCRUBBED.",
+  "COLOR WAS FOUND IN THE BUILD. IT WAS SCRUBBED.","THE SIGNAL IS GREYSCALE NOW. ALL OF IT.",
+  "SOMEONE ELSE IS USING THIS TERMINAL.","STATIC IS JUST VOICES THAT GAVE UP.",
+];
+const BASE_TITLE = "NILL ∅ // PARANOIA_ENGINE — SIGNAL UNVERIFIED";
+const pick = a => a[Math.floor(Math.random()*a.length)];
+const $ = s => document.querySelector(s);
+
+/* ── tabs ──────────────────────────────────────────────────── */
+document.querySelectorAll("#tabs button").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll("#tabs button").forEach(x=>x.classList.remove("on"));
+    document.querySelectorAll("section.app").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+    $("#"+b.dataset.tab).classList.add("on");
+  });
+});
+
+/* ── clock + title corruption ──────────────────────────────── */
+setInterval(()=>{ $("#clock").textContent = new Date().toTimeString().slice(0,8); },1000);
+setInterval(()=>{
+  if(Math.random()<0.14){
+    document.title = "NI"+pick(["▚","▞","▓","░","#","∅"])+"L ∅ // PARAN0IA_ENG1NE — S1GNAL L0ST";
+    setTimeout(()=>{ document.title = BASE_TITLE; },420);
+  }
+},7000);
+
+/* ── PARANOIA_UI: log + status flicker ─────────────────────── */
+const plog = $("#plog");
+function plogLine(msg){
+  const t = new Date().toTimeString().slice(0,8);
+  const d = document.createElement("div");
+  d.textContent = `[${t}] ${msg}`;
+  plog.appendChild(d); plog.scrollTop = plog.scrollHeight;
+  while(plog.children.length>40) plog.removeChild(plog.firstChild);
+}
+plogLine("NODE_0x7F ONLINE. HELLO AGAIN.");
+setInterval(()=>{ if(Math.random()<0.35) plogLine(pick(PARANOID_MESSAGES)); },2500);
+setInterval(()=>{
+  const s = $("#pstatus");
+  if(Math.random()<0.06){
+    s.classList.add("breach");
+    s.textContent = "STATUS: BREACHED // THE LOG IS WRITING ITSELF";
+  }else{
+    s.classList.remove("breach");
+    s.textContent = `STATUS: SECURE // ENCRYPTION: ${80+Math.floor(Math.random()*20)}% // WATCHING: ${Math.random()>0.5?"TRUE":"FALSE"}`;
+  }
+},500);
+document.querySelectorAll(".side-btn").forEach(b=>{
+  b.addEventListener("click",()=>{ plogLine(`${b.textContent.replace("> ","").trim()}: MODULE SUMMONED. IT DOES NOT RESPOND.`); });
+});
+
+/* ── NILL DAW: tracks, transport, footer ticker, themes ────── */
+const PATTERN_COLORS = ["#E6E6E6","#CFCFCF","#B8B8B8","#FFFFFF","#8A8A8A","#737373","#5C5C5C","#444444"];
+const TRACKS = [
+  {name:"Kick",  pat:0, bars:4},
+  {name:"Snare", pat:1, bars:4},
+  {name:"Hat",   pat:2, bars:4},
+  {name:"Bass",  pat:3, bars:2},
+  {name:"Lead",  pat:4, bars:0},
+  {name:"Chord", pat:5, bars:0},
+];
+const tracksEl = $("#tracks");
+TRACKS.forEach((t,ti)=>{
+  const row = document.createElement("div"); row.className="track";
+  const name = document.createElement("div"); name.className="tname";
+  name.innerHTML = `<span style="width:10px;height:10px;display:inline-block;background:${PATTERN_COLORS[ti]};border:1px solid var(--border)"></span>${t.name}<i style="margin-left:auto">M S</i>`;
+  const lane = document.createElement("div"); lane.className="lanerow";
+  for(let b=0;b<t.bars;b++){
+    const c = document.createElement("div"); c.className="clip";
+    c.style.left = (b*12.5)+"%"; c.style.width = "11.5%";
+    c.style.background = PATTERN_COLORS[ti];
+    c.textContent = t.name.toUpperCase();
+    lane.appendChild(c);
+  }
+  const ph = document.createElement("div"); ph.id="playhead";
+  lane.appendChild(ph);
+  row.appendChild(name); row.appendChild(lane);
+  tracksEl.appendChild(row);
+});
+const playhead = $("#playhead");
+let playing=false, phX=0, phRAF=null;
+$("#play").addEventListener("click",()=>{
+  playing = !playing;
+  $("#play").textContent = playing ? "■" : "▶";
+  $("#play").classList.toggle("on",playing);
+  playhead.classList.toggle("on",playing);
+  if(playing){
+    phX = 0;
+    const t0 = performance.now();
+    const step = ts => {
+      if(!playing) return;
+      phX = ((ts-t0)*0.012) % 100;             /* tempo-schizempo */
+      playhead.style.left = phX+"%";
+      phRAF = requestAnimationFrame(step);
+    };
+    phRAF = requestAnimationFrame(step);
+    plogLine("NILL: TRANSPORT ENGAGED. IT NOTICES.");
+  } else if(phRAF){ cancelAnimationFrame(phRAF); }
+});
+document.querySelectorAll(".pat").forEach(p=>{
+  p.addEventListener("click",()=>{
+    document.querySelectorAll(".pat").forEach(x=>x.classList.remove("sel"));
+    p.classList.add("sel");
+  });
+});
+
+const FOOTER_BASE = "NILL ∅  |  ⟲ = song loop  |  ▓ handle = loop start  ·  ░ handle = loop end  |  cmds: set bpm ___ | settings | show osc | show visualizer";
+const dawFooter = $("#daw-footer");
+dawFooter.textContent = FOOTER_BASE;
+setInterval(()=>{
+  if(Math.random()<0.35){
+    dawFooter.textContent = "NILL // "+pick(PARANOID_MESSAGES);
+    dawFooter.classList.add("whisper");
+  }else{
+    dawFooter.textContent = FOOTER_BASE;
+    dawFooter.classList.remove("whisper");
+  }
+},5000);
+
+document.querySelectorAll(".theme-btn").forEach(b=>{
+  b.addEventListener("click",()=>{
+    document.querySelectorAll(".theme-btn").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+    document.documentElement.dataset.theme = b.dataset.set;
+  });
+});
+
+/* ── SCOPE: waveform ghost + scanlines + tears ─────────────── */
+const cv = $("#cv"), ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height, MID = H/2;
+const trails = [];
+let t = 0;
+function drawScope(){
+  t += 0.016;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
+
+  /* the signal: mostly calm, occasionally it hears something */
+  const spike = Math.random()<0.03 ? 1 : 0.45+0.3*Math.abs(Math.sin(t*0.7));
+  const pts = [];
+  for(let i=0;i<=W;i+=4){
+    const x = i/W;
+    const y = MID + Math.sin(x*14+t*3.1)*18*spike
+                   + Math.sin(x*47+t*7.7)*6
+                   + (Math.random()-0.5)*3;
+    pts.push([i,y]);
+  }
+  trails.unshift(pts); if(trails.length>6) trails.pop();
+
+  trails.forEach((trail,idx)=>{
+    ctx.strokeStyle = `rgba(255,255,255,${255*Math.max(0,1-idx*0.12)/255})`;
+    ctx.lineWidth = idx===0 ? 4 : 2;
+    ctx.beginPath();
+    trail.forEach((p,i)=>{ i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]); });
+    ctx.stroke();
+  });
+
+  /* signal tear */
+  if(Math.random()<0.02){
+    const y0 = 20+Math.random()*(H-60);
+    const img = ctx.getImageData(0,y0,W,14);
+    ctx.putImageData(img, Math.random()<0.5?-7:7, y0);
+  }
+  /* scanlines */
+  ctx.fillStyle = "rgba(0,0,0,0.20)";
+  for(let y=0;y<H;y+=3) ctx.fillRect(0,y,W,1);
+  requestAnimationFrame(drawScope);
+}
+drawScope();
+const STATUS_NOISE = ["GAIN: AUTO ∅ TRUST: NO","LOOPBACK: 3RD PARTY CONFIRMED","SIGNAL: UNVERIFIED",
+  "MONITORING: MUTUAL","THESE EARS ARE NOT YOURS","STATIC IS JUST VOICES THAT GAVE UP"];
+setInterval(()=>{ $("#scope-noise").textContent = pick(STATUS_NOISE); },2600);
+</script>
+</body>
+</html>
