@@ -1,5 +1,5 @@
 """
-SERUM 2 | TERMINAL EDITION — Python/Tkinter
+SERUM_2 ∅ GHOST_PATCH — Python/Tkinter — mono build
 FOCUS: LEFT PANEL (OSC 1 & OSC 2) - FULLY FUNCTIONAL
 
 FEATURES (THIS VERSION):
@@ -485,7 +485,7 @@ def label(parent, text, size=9, color=FG_DIM, bold=False):
 class SerumApp:
     def __init__(self, root):
         self.root = root
-        root.title('SERUM 2 [TERMINAL EDITION]')
+        root.title('SERUM_2 ∅ GHOST_PATCH — MONO')
         root.configure(bg=BG_BLACK)
         root.geometry('1200x900')
         root.minsize(1000, 800)
@@ -547,7 +547,7 @@ class SerumApp:
         bar.pack(fill='x')
         bar.pack_propagate(False)
         sep(bar).pack(side='bottom', fill='x')
-        label(bar, 'SERUM 2 // TERMINAL EDITION', size=11, color=FG_WHITE, bold=True).pack(side='left', padx=15)
+        label(bar, 'SERUM_2 ∅ GHOST_PATCH // MONO', size=11, color=FG_WHITE, bold=True).pack(side='left', padx=15)
         right = tk.Frame(bar, bg=BG_BLACK)
         right.pack(side='right', padx=15)
         label(right, 'OSC 1 + OSC 2 | Independent Controls', size=9).pack(side='left', padx=15)
@@ -557,8 +557,8 @@ class SerumApp:
         bar.pack(fill='x', side='bottom')
         bar.pack_propagate(False)
         sep(bar).pack(side='top', fill='x')
-        label(bar, 'PRESET: DEFAULT_PATCH', size=8).pack(side='left', padx=15)
-        self.cpu_label = label(bar, 'VOICES: 0/16', size=8)
+        label(bar, 'PATCH: UNSTABLE ∅ IT CHANGES WHEN UNSUPERVISED', size=8).pack(side='left', padx=15)
+        self.cpu_label = label(bar, 'VOICES: 0/16 ∅ NOT ALL YOURS', size=8)
         self.cpu_label.pack(side='right', padx=15)
 
     def _build_keyboard(self):

@@ -479,8 +479,8 @@ class PlaylistView(QWidget):
         # ---- Loop handles on ruler ----
         # Draw a thin line + triangle handle for start and end
         for handle_beat, color_hex, side in [
-            (self.daw.loop_start, "#4AF", "start"),
-            (self.daw.loop_end,   "#F84", "end"),
+            (self.daw.loop_start, "#F4F4F4", "start"),
+            (self.daw.loop_end,   "#8C8C8C", "end"),
         ]:
             hx    = int(self.beat_to_x(handle_beat))
             hcol  = QColor(color_hex)
@@ -518,10 +518,10 @@ class PlaylistView(QWidget):
             painter.drawText(6, y + 16, track.name[:12])
             painter.setFont(QFont("Consolas", 7))
             if track.muted:
-                painter.setPen(QColor("#F44"))
+                painter.setPen(QColor("#909090"))
                 painter.drawText(6, y + 30, "MUTED")
             elif track.solo:
-                painter.setPen(QColor("#FC0"))
+                painter.setPen(QColor("#FFFFFF"))
                 painter.drawText(6, y + 30, "SOLO")
 
         # ---- Clips ----

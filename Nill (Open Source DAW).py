@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-NILL | Open Source DAW
+NILL ∅ | PARANOID AUDIO WORKSTATION — mono build
+
+Strictly greyscale. Strictly unwell.
 
 - Horizontal timeline with pattern blocks/clips on tracks
 - Drag clips to move, resize edges, double-click to edit in piano roll
@@ -11,6 +13,7 @@ NILL | Open Source DAW
 - Note preview minimap inside playlist clip blocks
 - FL Studio loop-paint: left/right-click drag stamps/extends clips
 - Song loop region: drag handles on the ruler bar, ⟲ button to enable
+- Paranoia ticker in the footer. It is not a bug.
 
 Requirements:
     pip install PySide6 sounddevice numpy
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import subprocess
 import sys
 import time
@@ -55,77 +59,114 @@ from PySide6.QtWidgets import (
 # ============================ CONSTANTS ============================
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# ---- MONO BUILD -------------------------------------------------------------
+# Every colour in this repository is greyscale. R == G == B, always.
+# If a hex code in here contains hue, it is an intruder. Scrub it.
+# -----------------------------------------------------------------------------
 PATTERN_COLORS = [
     "#E6E6E6", "#CFCFCF", "#B8B8B8", "#FFFFFF",
     "#8A8A8A", "#737373", "#5C5C5C", "#444444",
     "#AAAAAA", "#666666", "#999999", "#CCCCCC",
 ]
 
+PARANOID_MESSAGES = [
+    "THE METRONOME IS COUNTING YOU.",
+    "SIGNAL VERIFIED BY NO ONE.",
+    "DO NOT NAME THE TRACKS. THEY LISTEN FOR NAMES.",
+    "LOOP DETECTED. YOU ARE INSIDE IT.",
+    "BPM READS YOUR PULSE. IT IS ELEVATED.",
+    "THE PREVIEW NOTES WERE NOT YOURS.",
+    "SILENCE BETWEEN BEATS IS GROWING.",
+    "THIS PROJECT SAVES ITSELF WHILE YOU SLEEP.",
+    "AUDIO DRIVER DENIES EVERYTHING.",
+    "WE RECORDED THE ROOM, NOT THE SONG.",
+    "ECHO CONFIRMED. THERE IS NO ROOM.",
+    "TRUST THE PLAYHEAD. NOTHING ELSE.",
+    "YOUR MOVEMENTS ARE QUANTIZED. 0.25 SNAP.",
+    "SOMEONE SOLOED A TRACK YOU CANNOT SEE.",
+    "THE MIX WAS FINISHED BEFORE YOU ARRIVED.",
+    "COLOR WAS DETECTED ONCE. IT WAS SCRUBBED.",
+]
+
 THEMES = {
-    "Terminal": {
-        "bg_main": "#0B0B0B", "bg_header": "#151515", "bg_panel": "#0A0A0A",
-        "bg_row_even": "#111111", "bg_row_odd": "#151515", "bg_muted": "#080808",
-        "bg_piano": "#050505", "key_black": "#202020", "key_white": "#E6E6E6",
-        "row_black": "#141414", "row_white": "#181818",
-        "grid_bar": "#555555", "grid_beat": "#3A3A3A", "grid_fine": "#262626", "grid_sub": "#333333",
-        "text_main": "#E6E6E6", "text_dim": "#777777", "text_bright": "#AAAAAA", "text_label": "#C8C8C8",
-        "text_clip": "#0A0A0A", "accent": "#E6E6E6", "accent_hover": "#FFFFFF",
-        "button_bg": "#1A1A1A", "button_border": "#444444", "button_hover": "#242424",
-        "border": "#4A4A4A", "clip_border": "#DDDDDD", "note_muted": "#5F5F5F",
-        "loop_start": "#4AF", "loop_end": "#F84", "mute": "#F44", "solo": "#FC0", "playhead": "#FFFFFF",
+    "STATIC": {
+        "bg_main": "#050505", "bg_header": "#101010", "bg_panel": "#030303",
+        "bg_row_even": "#0C0C0C", "bg_row_odd": "#101010", "bg_muted": "#060606",
+        "bg_piano": "#020202", "key_black": "#1C1C1C", "key_white": "#E8E8E8",
+        "row_black": "#0E0E0E", "row_white": "#121212",
+        "grid_bar": "#6E6E6E", "grid_beat": "#3C3C3C", "grid_fine": "#232323", "grid_sub": "#2E2E2E",
+        "text_main": "#EDEDED", "text_dim": "#7A7A7A", "text_bright": "#B9B9B9", "text_label": "#D4D4D4",
+        "text_clip": "#060606", "accent": "#EDEDED", "accent_hover": "#FFFFFF",
+        "button_bg": "#161616", "button_border": "#4A4A4A", "button_hover": "#202020",
+        "border": "#505050", "clip_border": "#DCDCDC", "note_muted": "#616161",
+        "loop_start": "#F4F4F4", "loop_end": "#8C8C8C", "mute": "#909090", "solo": "#FFFFFF", "playhead": "#FFFFFF",
         "overlay": "#000000",
     },
-    "Midnight Blue": {
-        "bg_main": "#0A0B10", "bg_header": "#121628", "bg_panel": "#080A14",
-        "bg_row_even": "#0D1020", "bg_row_odd": "#121628", "bg_muted": "#050610",
-        "bg_piano": "#040510", "key_black": "#1A1E30", "key_white": "#C8D0E0",
-        "row_black": "#101228", "row_white": "#141A30",
-        "grid_bar": "#4A5580", "grid_beat": "#2A3050", "grid_fine": "#1A1E38", "grid_sub": "#222540",
-        "text_main": "#D0D8E8", "text_dim": "#606B88", "text_bright": "#8899BB", "text_label": "#A0AACC",
-        "text_clip": "#080A14", "accent": "#6699FF", "accent_hover": "#88BBFF",
-        "button_bg": "#11152A", "button_border": "#334466", "button_hover": "#1A2040",
-        "border": "#334466", "clip_border": "#AABBDD", "note_muted": "#4A5570",
-        "loop_start": "#4488FF", "loop_end": "#FF8844", "mute": "#FF4466", "solo": "#FFCC00", "playhead": "#FFFFFF",
-        "overlay": "#000010",
+    "DEAD CHANNEL": {
+        "bg_main": "#0A0A0A", "bg_header": "#131313", "bg_panel": "#090909",
+        "bg_row_even": "#101010", "bg_row_odd": "#141414", "bg_muted": "#0B0B0B",
+        "bg_piano": "#070707", "key_black": "#181818", "key_white": "#9E9E9E",
+        "row_black": "#121212", "row_white": "#151515",
+        "grid_bar": "#4E4E4E", "grid_beat": "#303030", "grid_fine": "#1E1E1E", "grid_sub": "#262626",
+        "text_main": "#A8A8A8", "text_dim": "#5C5C5C", "text_bright": "#8A8A8A", "text_label": "#969696",
+        "text_clip": "#0A0A0A", "accent": "#A8A8A8", "accent_hover": "#C9C9C9",
+        "button_bg": "#141414", "button_border": "#3B3B3B", "button_hover": "#1D1D1D",
+        "border": "#3F3F3F", "clip_border": "#A3A3A3", "note_muted": "#4E4E4E",
+        "loop_start": "#C9C9C9", "loop_end": "#7A7A7A", "mute": "#7E7E7E", "solo": "#E3E3E3", "playhead": "#D6D6D6",
+        "overlay": "#050505",
     },
-    "Forest": {
-        "bg_main": "#0B100B", "bg_header": "#152015", "bg_panel": "#0A0F0A",
-        "bg_row_even": "#111811", "bg_row_odd": "#152015", "bg_muted": "#080A08",
-        "bg_piano": "#050805", "key_black": "#1E281E", "key_white": "#C8D8C8",
-        "row_black": "#141E14", "row_white": "#182418",
-        "grid_bar": "#558055", "grid_beat": "#3A503A", "grid_fine": "#263826", "grid_sub": "#2A3A2A",
-        "text_main": "#D0E8D0", "text_dim": "#608860", "text_bright": "#88BB88", "text_label": "#AACCAA",
-        "text_clip": "#0A0F0A", "accent": "#88DD88", "accent_hover": "#AAFFAA",
-        "button_bg": "#111A11", "button_border": "#446644", "button_hover": "#1A2A1A",
-        "border": "#446644", "clip_border": "#BBDDBB", "note_muted": "#4A704A",
-        "loop_start": "#44FF88", "loop_end": "#FFAA44", "mute": "#FF6644", "solo": "#FFCC00", "playhead": "#FFFFFF",
-        "overlay": "#001000",
+    "XEROX": {
+        "bg_main": "#E8E8E8", "bg_header": "#D8D8D8", "bg_panel": "#ECECEC",
+        "bg_row_even": "#E2E2E2", "bg_row_odd": "#DCDCDC", "bg_muted": "#EFEFEF",
+        "bg_piano": "#F2F2F2", "key_black": "#2A2A2A", "key_white": "#F8F8F8",
+        "row_black": "#DFDFDF", "row_white": "#D9D9D9",
+        "grid_bar": "#555555", "grid_beat": "#909090", "grid_fine": "#C2C2C2", "grid_sub": "#ADADAD",
+        "text_main": "#111111", "text_dim": "#6E6E6E", "text_bright": "#3D3D3D", "text_label": "#2A2A2A",
+        "text_clip": "#161616", "accent": "#111111", "accent_hover": "#000000",
+        "button_bg": "#D5D5D5", "button_border": "#8A8A8A", "button_hover": "#C4C4C4",
+        "border": "#7E7E7E", "clip_border": "#2E2E2E", "note_muted": "#9B9B9B",
+        "loop_start": "#111111", "loop_end": "#666666", "mute": "#555555", "solo": "#000000", "playhead": "#000000",
+        "overlay": "#FFFFFF",
     },
-    "Crimson": {
-        "bg_main": "#100A0A", "bg_header": "#281212", "bg_panel": "#140808",
-        "bg_row_even": "#201010", "bg_row_odd": "#281212", "bg_muted": "#100505",
-        "bg_piano": "#100404", "key_black": "#301A1A", "key_white": "#E0C8C8",
-        "row_black": "#281010", "row_white": "#301414",
-        "grid_bar": "#805050", "grid_beat": "#503030", "grid_fine": "#381A1A", "grid_sub": "#402222",
-        "text_main": "#E8D0D0", "text_dim": "#886060", "text_bright": "#BB8888", "text_label": "#CCAAAA",
-        "text_clip": "#140808", "accent": "#FF6688", "accent_hover": "#FF88AA",
-        "button_bg": "#2A1111", "button_border": "#664444", "button_hover": "#401818",
-        "border": "#664444", "clip_border": "#DDBBBB", "note_muted": "#705050",
-        "loop_start": "#FF4466", "loop_end": "#FFAA44", "mute": "#FF4444", "solo": "#FFCC00", "playhead": "#FFFFFF",
-        "overlay": "#100000",
+    "ASHES": {
+        "bg_main": "#1A1A1A", "bg_header": "#232323", "bg_panel": "#171717",
+        "bg_row_even": "#1F1F1F", "bg_row_odd": "#242424", "bg_muted": "#151515",
+        "bg_piano": "#131313", "key_black": "#2A2A2A", "key_white": "#CFCFCF",
+        "row_black": "#202020", "row_white": "#252525",
+        "grid_bar": "#5A5A5A", "grid_beat": "#3E3E3E", "grid_fine": "#2C2C2C", "grid_sub": "#343434",
+        "text_main": "#C4C4C4", "text_dim": "#8A8A8A", "text_bright": "#A9A9A9", "text_label": "#B5B5B5",
+        "text_clip": "#1A1A1A", "accent": "#C4C4C4", "accent_hover": "#E0E0E0",
+        "button_bg": "#242424", "button_border": "#4C4C4C", "button_hover": "#2E2E2E",
+        "border": "#4C4C4C", "clip_border": "#B9B9B9", "note_muted": "#6A6A6A",
+        "loop_start": "#D9D9D9", "loop_end": "#9E9E9E", "mute": "#9E9E9E", "solo": "#F0F0F0", "playhead": "#E8E8E8",
+        "overlay": "#101010",
     },
-    "Amber": {
-        "bg_main": "#100C0A", "bg_header": "#281E12", "bg_panel": "#141008",
-        "bg_row_even": "#201811", "bg_row_odd": "#281E12", "bg_muted": "#100A05",
-        "bg_piano": "#100805", "key_black": "#30281A", "key_white": "#E0D8C8",
-        "row_black": "#281E14", "row_white": "#302418",
-        "grid_bar": "#806644", "grid_beat": "#504430", "grid_fine": "#382E1A", "grid_sub": "#403822",
-        "text_main": "#E8DCC8", "text_dim": "#887760", "text_bright": "#BBAA88", "text_label": "#CCBBAA",
-        "text_clip": "#141008", "accent": "#FFAA44", "accent_hover": "#FFCC66",
-        "button_bg": "#2A1E11", "button_border": "#665544", "button_hover": "#402A15",
-        "border": "#665544", "clip_border": "#DDD0BB", "note_muted": "#705A4A",
-        "loop_start": "#FFAA44", "loop_end": "#FF6644", "mute": "#FF6644", "solo": "#FFCC00", "playhead": "#FFFFFF",
-        "overlay": "#100A00",
+    "CARBON": {
+        "bg_main": "#0E0E0E", "bg_header": "#191919", "bg_panel": "#0C0C0C",
+        "bg_row_even": "#151515", "bg_row_odd": "#191919", "bg_muted": "#0A0A0A",
+        "bg_piano": "#080808", "key_black": "#202020", "key_white": "#DEDEDE",
+        "row_black": "#171717", "row_white": "#1B1B1B",
+        "grid_bar": "#5E5E5E", "grid_beat": "#383838", "grid_fine": "#222222", "grid_sub": "#2C2C2C",
+        "text_main": "#DCDCDC", "text_dim": "#6F6F6F", "text_bright": "#ABABAB", "text_label": "#C6C6C6",
+        "text_clip": "#0E0E0E", "accent": "#DCDCDC", "accent_hover": "#FFFFFF",
+        "button_bg": "#1B1B1B", "button_border": "#474747", "button_hover": "#262626",
+        "border": "#4D4D4D", "clip_border": "#D2D2D2", "note_muted": "#5C5C5C",
+        "loop_start": "#EFEFEF", "loop_end": "#858585", "mute": "#8A8A8A", "solo": "#FFFFFF", "playhead": "#FFFFFF",
+        "overlay": "#000000",
+    },
+    "OVEREXPOSED": {
+        "bg_main": "#F4F4F4", "bg_header": "#E4E4E4", "bg_panel": "#F7F7F7",
+        "bg_row_even": "#EFEFEF", "bg_row_odd": "#E9E9E9", "bg_muted": "#FAFAFA",
+        "bg_piano": "#FBFBFB", "key_black": "#3A3A3A", "key_white": "#FFFFFF",
+        "row_black": "#ECECEC", "row_white": "#E6E6E6",
+        "grid_bar": "#7C7C7C", "grid_beat": "#A9A9A9", "grid_fine": "#CFCFCF", "grid_sub": "#BDBDBD",
+        "text_main": "#1A1A1A", "text_dim": "#767676", "text_bright": "#444444", "text_label": "#303030",
+        "text_clip": "#F4F4F4", "accent": "#1A1A1A", "accent_hover": "#000000",
+        "button_bg": "#E1E1E1", "button_border": "#949494", "button_hover": "#D2D2D2",
+        "border": "#9E9E9E", "clip_border": "#3A3A3A", "note_muted": "#A6A6A6",
+        "loop_start": "#1A1A1A", "loop_end": "#6E6E6E", "mute": "#5E5E5E", "solo": "#000000", "playhead": "#000000",
+        "overlay": "#FFFFFF",
     },
 }
 
@@ -1196,7 +1237,8 @@ class PianoRoll(QWidget):
 class Nill(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NILL | Terminal Interface DAW")
+        self.BASE_TITLE = "NILL ∅ // PARANOIA_ENGINE — SIGNAL UNVERIFIED"
+        self.setWindowTitle(self.BASE_TITLE)
         self.resize(1600, 950)
         self.setMinimumSize(1200, 700)
 
@@ -1214,8 +1256,8 @@ class Nill(QMainWindow):
         self.osc_process        = None
         self.visualizer_process = None
 
-        self.current_theme_name = "Terminal"
-        self.theme = THEMES["Terminal"]
+        self.current_theme_name = "STATIC"
+        self.theme = THEMES["STATIC"]
 
         self.synth  = ChiptuneSynth()
         self.stream = None
@@ -1445,12 +1487,25 @@ class Nill(QMainWindow):
         main_splitter.setSizes([520, 340])
         outer.addWidget(main_splitter, 1)
 
-        footer = QLabel(
-            "NILL DAW  |  ⟲ = song loop  |  blue handle = loop start  |  orange handle = loop end  "
+        self._footer_base = (
+            "NILL ∅  |  ⟲ = song loop  |  ▓ handle = loop start  ·  ░ handle = loop end  "
             "|  cmds: set bpm ___ | settings | show osc | show visualizer"
         )
-        footer.setStyleSheet("color:#9A9A9A; padding:3px;")
-        outer.addWidget(footer)
+        self.footer_label = QLabel(self._footer_base)
+        self.footer_label.setStyleSheet("color:#9A9A9A; padding:3px;")
+        outer.addWidget(self.footer_label)
+
+        # -- paranoia ticker: the footer whispers back --------------------
+        self._paranoia_timer = QTimer(self)
+        self._paranoia_timer.setInterval(5000)
+        self._paranoia_timer.timeout.connect(self._tick_paranoia)
+        self._paranoia_timer.start()
+
+        # -- title corruption: rare, brief, deniable ---------------------
+        self._title_glitch_timer = QTimer(self)
+        self._title_glitch_timer.setInterval(7000)
+        self._title_glitch_timer.timeout.connect(self._maybe_glitch_title)
+        self._title_glitch_timer.start()
 
         self.update_stylesheet()
 
@@ -1525,6 +1580,27 @@ class Nill(QMainWindow):
         for dlg in self.findChildren(QDialog):
             if hasattr(dlg, "on_theme_changed"):
                 dlg.on_theme_changed()
+
+    # ------------------------------------------------------------------
+    # Paranoia ticker
+    # ------------------------------------------------------------------
+
+    def _tick_paranoia(self) -> None:
+        """The footer occasionally speaks. It should not speak."""
+        if random.random() < 0.35:
+            self.footer_label.setText(f"NILL // {random.choice(PARANOID_MESSAGES)}")
+            self.footer_label.setStyleSheet("color:#FFFFFF; padding:3px;")
+        else:
+            self.footer_label.setText(self._footer_base)
+            self.footer_label.setStyleSheet("color:#9A9A9A; padding:3px;")
+
+    def _maybe_glitch_title(self) -> None:
+        """Rare title corruption. It denies everything afterwards."""
+        if random.random() < 0.12:
+            junk = random.choice("▚▞▓░#∅?X")
+            corrupted = f"NI{junk}L ∅ // PARAN0IA_ENG1NE — S1GNAL L0ST"
+            self.setWindowTitle(corrupted)
+            QTimer.singleShot(420, lambda: self.setWindowTitle(self.BASE_TITLE))
 
     def update_stylesheet(self) -> None:
         t = self.theme
@@ -1722,7 +1798,7 @@ class Nill(QMainWindow):
 
     def project_data(self) -> dict:
         return {
-            "app": "Nill TERMINAL", "version": 6,
+            "app": "Nill TERMINAL // MONO", "version": 6,
             "bpm": self.bpm, "snap": self.current_snap,
             "loop_enabled": self.loop_enabled,
             "loop_start":   self.loop_start,
@@ -1991,14 +2067,14 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        title = QLabel("◈ NILL SETTINGS")
+        title = QLabel("∅ NILL // CONTROL_ROOM")
         title.setStyleSheet("font-size: 16px; font-weight: bold; color: #FFF;")
         layout.addWidget(title)
 
         # Import Drums
         drums_box = QFrame()
         drums_layout = QVBoxLayout(drums_box)
-        drums_layout.addWidget(QLabel("⬡ Import Drums"))
+        drums_layout.addWidget(QLabel("▚ DRUM INTAKE ∅ UNTRUSTED"))
         drums_layout.addWidget(QLabel("Browse a ZIP containing WAV / MP3 / OGG / FLAC drum kits."))
         btn_drums = QPushButton("Import Drums")
         btn_drums.clicked.connect(self.import_drums)
@@ -2008,7 +2084,7 @@ class SettingsDialog(QDialog):
         # Import MIDI
         midi_box = QFrame()
         midi_layout = QVBoxLayout(midi_box)
-        midi_layout.addWidget(QLabel("♩ Import MIDI"))
+        midi_layout.addWidget(QLabel("░ MIDI INGEST ∅ UNSIGNED"))
         midi_layout.addWidget(QLabel("Browse for a .mid / .midi file and import note events."))
         btn_midi = QPushButton("Import MIDI")
         btn_midi.clicked.connect(self.import_midi)
@@ -2018,7 +2094,7 @@ class SettingsDialog(QDialog):
         # Themes
         themes_box = QFrame()
         themes_layout = QVBoxLayout(themes_box)
-        themes_layout.addWidget(QLabel("◈ Themes"))
+        themes_layout.addWidget(QLabel("▚ SIGNAL DECAY ∅ THEMES"))
         grid = QHBoxLayout()
         for name in THEMES:
             btn = QPushButton(f"● {name}")
@@ -2030,7 +2106,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(themes_box)
 
         # Info
-        btn_info = QPushButton("ℹ Info")
+        btn_info = QPushButton("∅ INFO // WHO IS NILL")
         btn_info.clicked.connect(self.show_info)
         layout.addWidget(btn_info)
 
@@ -2051,7 +2127,7 @@ class SettingsDialog(QDialog):
             QPushButton:hover {{ background: {t['button_hover']}; }}
         """)
         for w in self.findChildren(QLabel):
-            if w.text().startswith("◈"):
+            if w.text().startswith(("◈", "∅", "▚")):
                 w.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {t['accent_hover']};")
 
     def on_theme_changed(self) -> None:
@@ -2080,20 +2156,27 @@ class SettingsDialog(QDialog):
 
     def show_info(self) -> None:
         QMessageBox.information(
-            self, "About NILL",
-            "NILL | Open Source Terminal Interface DAW\n\n"
-            "Version 6.0\n"
-            "Built with PySide6, NumPy, and sounddevice.\n\n"
+            self, "About NILL ∅",
+            "NILL ∅ | PARANOID AUDIO WORKSTATION\n"
+            "─────────────────────────────\n"
+            "mono build // trust nothing // v6.0\n\n"
+            "every theme is greyscale. that is not\n"
+            "a limitation. it is a diagnosis.\n\n"
+            "SIGNAL DECAY PRESETS:\n"
+            "  STATIC · DEAD CHANNEL · XEROX\n"
+            "  ASHES · CARBON · OVEREXPOSED\n\n"
             "Commands:\n"
-            "  settings          – open this dialog\n"
-            "  set bpm ___       – change tempo\n"
+            "  settings          – open the control room\n"
+            "  set bpm ___       – change tempo (it notices)\n"
             "  show osc          – open synthesizer\n"
             "  show visualizer   – open audio visualizer\n\n"
             "Shortcuts:\n"
             "  Space             – play/stop\n"
             "  Delete            – delete selected note\n"
             "  Ctrl+S            – save project\n"
-            "  Ctrl+O            – open project"
+            "  Ctrl+O            – open project\n\n"
+            "if the playhead moves while stopped,\n"
+            "ignore it. it always does that."
         )
 
 # ============================ EMBEDDED OSC ============================
@@ -2168,7 +2251,7 @@ class PolyphonicSynth:
 
     def note_on(self, midi_note):
         with self._lock:
-            freq = 440 * (2 ** ((midi_note - 69) / 12))
+            freq = 440 * (2 ** ((midi_ni_note - 69) / 12))
             self.active_notes[midi_note] = {
                 'freq': freq, 'phase1': self.osc1_phase * np.pi * 2,
                 'phase2': self.osc2_phase * np.pi * 2, 'vel': 0.8,
@@ -2388,7 +2471,7 @@ def label(parent, text, size=9, color=FG_DIM, bold=False):
 
 class SerumApp:
     def __init__(self, root):
-        self.root = root; root.title('Nill OSC')
+        self.root = root; root.title('NILL_OSC ∅ THEY_ARE_LISTENING')
         root.configure(bg=BG_BLACK); root.geometry('1200x900'); root.minsize(1000, 800)
         self.synth = PolyphonicSynth()
         self._wt_canvases = []; self._playing_notes = {}
@@ -2423,14 +2506,14 @@ class SerumApp:
     def _build_titlebar(self):
         bar = tk.Frame(self.root, bg=BG_BLACK, height=35); bar.pack(fill='x'); bar.pack_propagate(False)
         sep(bar).pack(side='bottom', fill='x')
-        label(bar, 'Nill OSC', size=11, color=FG_WHITE, bold=True).pack(side='left', padx=15)
-        label(tk.Frame(bar, bg=BG_BLACK), 'OSC 1 + OSC 2', size=9).pack(side='left', padx=15)
+        label(bar, 'NILL_OSC ∅', size=11, color=FG_WHITE, bold=True).pack(side='left', padx=15)
+        label(tk.Frame(bar, bg=BG_BLACK), 'OSC 1 + OSC 2 // HALLUCINATION MODE', size=9).pack(side='left', padx=15)
 
     def _build_bottombar(self):
         bar = tk.Frame(self.root, bg=BG_BLACK, height=28); bar.pack(fill='x', side='bottom'); bar.pack_propagate(False)
         sep(bar).pack(side='top', fill='x')
-        label(bar, 'PRESET: DEFAULT_PATCH', size=8).pack(side='left', padx=15)
-        self.cpu_label = label(bar, 'VOICES: 0/16', size=8); self.cpu_label.pack(side='right', padx=15)
+        label(bar, 'PATCH: UNSIGNED ∅ DO NOT SAVE PRESETS', size=8).pack(side='left', padx=15)
+        self.cpu_label = label(bar, 'VOICES: 0/16 ∅ AUDIBLE', size=8); self.cpu_label.pack(side='right', padx=15)
 
     def _build_keyboard(self):
         kf = tk.Frame(self.root, bg=BG_BLACK, height=140); kf.pack(fill='x', side='bottom')
@@ -2456,6 +2539,11 @@ class SerumApp:
         self._build_osc(inner, 2, 'OSC 2', 'saw')
 
     def _build_waveform_selector(self, parent):
+        sep(parent).pack(fill='x')
+        sec = tk.Frame(parent, bg=BG_BLACK); sec.pack(fill='x', padx=12, pady=10)
+        label(sec, '[GLOBAL WAVEFORM]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0,6))
+        label(sec, 'M=Next N=Prev (overrides OSC)', size=7, color=FG_DIM).pack(anchor='w', pady=(0,8))
+        bf = tk.Frame(sec, bg=BG_BLACK); bf.pac_waveform_selector(self, parent):
         sep(parent).pack(fill='x')
         sec = tk.Frame(parent, bg=BG_BLACK); sec.pack(fill='x', padx=12, pady=10)
         label(sec, '[GLOBAL WAVEFORM]', size=9, color=FG_WHITE, bold=True).pack(anchor='w', pady=(0,6))
@@ -2678,7 +2766,7 @@ def run_embedded_visualizer() -> None:
 
     pygame.init()
     screen = pygame.display.set_mode((NATIVE_W, NATIVE_H))
-    pygame.display.set_caption("Ear Candy")
+    pygame.display.set_caption("NILL_SCOPE ∅ DEAD_SIGNAL")
     clock = pygame.time.Clock()
 
     audio_block = np.zeros((BLOCK_SIZE, 2), dtype=np.float32)
@@ -2772,7 +2860,8 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--nill-osc":
         run_embedded_osc(); return
 
-    print("Nill | Terminal Interface DAW")
+    print("NILL ∅ // PARANOIA_ENGINE — signal unverified")
+    print("mono build // every theme is greyscale // trust nothing")
     app    = QApplication(sys.argv)
     window = Nill()
     window.show()

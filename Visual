@@ -1,5 +1,6 @@
 import math
 import ctypes
+import random
 import sys
 import numpy as np
 try:
@@ -45,7 +46,7 @@ if AUDIO_DEVICE is None:
 
 pygame.init()
 screen = pygame.display.set_mode((NATIVE_W, NATIVE_H))  # Fixed size, no resize
-pygame.display.set_caption("Ear Candy")
+pygame.display.set_caption("NILL_SCOPE ∅ DEAD_SIGNAL")
 
 clock = pygame.time.Clock()
 
@@ -149,6 +150,22 @@ float_enabled = False
 button_rect = pygame.Rect(20, 20, 160, 45)
 font = pygame.font.SysFont("Segoe UI", 20, bold=True)
 
+# mono build — readout + scanlines + noise
+mono_font = pygame.font.SysFont("consolas", 13, bold=True)
+mono_small = pygame.font.SysFont("consolas", 11)
+STATUS_NOISE = [
+    "GAIN: AUTO ∅ TRUST: NO",
+    "LOOPBACK: 3RD PARTY CONFIRMED",
+    "SIGNAL: UNVERIFIED",
+    "MONITORING: MUTUAL",
+    "THESE EARS ARE NOT YOURS",
+    "STATIC IS JUST VOICES THAT GAVE UP",
+]
+
+scan_surface = pygame.Surface((NATIVE_W, NATIVE_H), pygame.SRCALPHA)
+for y in range(0, NATIVE_H, 3):
+    pygame.draw.line(scan_surface, (0, 0, 0, 46), (0, y), (NATIVE_W, y))
+
 PANEL_HEIGHT = 80
 
 def draw_glass_panel(surface):
@@ -161,6 +178,11 @@ def draw_glass_panel(surface):
         alpha = int(80 * (1 - y / reflection.get_height()))
         pygame.draw.line(reflection, (255, 255, 255, alpha), (0, y), (NATIVE_W, y))
     surface.blit(reflection, (0, 0))
+
+    hdr = mono_font.render("NILL_SCOPE ∅ DEAD_SIGNAL", True, (230, 230, 230))
+    surface.blit(hdr, (18, 10))
+    st = mono_small.render(random.choice(STATUS_NOISE), True, (140, 140, 140))
+    surface.blit(st, (18, 32))
 
 # =========================
 # MAIN LOOP
@@ -249,8 +271,16 @@ while running:
     # Draw frame
     visual_surface.blit(frame_surface, (0, 0))
 
-    # Glass panel + button
+    # Signal damage: rare horizontal tear
+    if random.random() < 0.02 and frame_rect.height > 40:
+        band_y = random.randint(frame_rect.y, frame_rect.bottom - 20)
+        band = pygame.Surface((frame_rect.width, 14), pygame.SRCALPHA)
+        band.blit(visual_surface, (0, 0), (frame_rect.x, band_y, frame_rect.width, 14))
+        visual_surface.blit(band, (frame_rect.x + random.choice((-7, 7)), band_y))
+
+    # Glass panel + readout, then scanlines over everything
     draw_glass_panel(visual_surface)
+    visual_surface.blit(scan_surface, (0, 0))
 
     # Display
     screen.fill((0, 0, 0))

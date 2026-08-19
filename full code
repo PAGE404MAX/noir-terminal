@@ -10,7 +10,7 @@ import threading
 BG_COLOR = "#000000"
 FG_COLOR = "#FFFFFF"
 HL_COLOR = "#1a1a1a"
-GLITCH_COLOR = "#33ff33" # Matrix green for code
+GLITCH_COLOR = "#B4B4B4"  # static grey. green was removed. green was never there.
 FONT_MAIN = ("Courier", 10)
 FONT_BOLD = ("Courier", 12, "bold")
 FONT_GLITCH = ("Courier", 8)
@@ -31,12 +31,18 @@ PARANOID_MESSAGES = [
     "SCANNING FOR PROXIMITY SENSORS...",
     "ACCESS GRANTED TO NO_ONE.",
     "01001000 01000101 01001100 01010000",
+    "COLOR WAS FOUND IN THE BUILD. IT WAS SCRUBBED.",
+    "THE SIGNAL IS GREYSCALE NOW. ALL OF IT.",
+    "SOMEONE ELSE IS USING THIS TERMINAL.",
+    "THE TERMINAL REMEMBERS WHAT YOU DELETED.",
+    "DO NOT MAXIMIZE THE WINDOW. IT MAXIMIZES BACK.",
+    "STATIC IS JUST VOICES THAT GAVE UP.",
 ]
 
 class ParanoidUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("NODE_0x7F // PARANOIA ENGINE")
+        self.root.title("NODE_0x7F // PARANOIA_ENGINE ∅ TRUST_NOTHING")
         self.root.geometry("1100x750")
         self.root.configure(bg=BG_COLOR)
         
@@ -143,15 +149,15 @@ class ParanoidUI:
         glitch_text = """
 ██████╗  █████╗ ██████╗  █████╗ ███╗   ██╗ ██████╗ ██╗██████╗ 
 ██╔══██╗██╔══██╗██╔══██╗██╔══██╗████╗  ██║██╔═══██╗██║██╔══██╗
-██████╔╝███████║██████╔╝███████║██╔██╗ ██║██║   ██║██║██║  ██║
+██████╔╝███████║██████╔╝███████║██╔██╗ ██║██║   ██║██║██║  ▒█║
 ██╔═══╝ ██╔══██║██╔══██╗██╔══██║██║╚██╗██║██║   ██║██║██║  ██║
-██║     ██║  ██║██║  ██║██║  ██║██║ ╚████║╚██████╔╝██║██████╔╝
-╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚══════╝
+██║     ██║  ██║▒█║  ██║██║  ██║██║ ╚████║╚██████╔╝██║██████╔╝
+╚═╝     ╚═╝  ╚═╝╚═╝  ░═╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚▓█████╝
         """
         
         tk.Label(self.current_frame, text=glitch_text, bg=BG_COLOR, fg=FG_COLOR, font=("Courier", 8)).pack(pady=40)
         
-        lbl = tk.Label(self.current_frame, text="[ IDENTITY VERIFIED: UNKNOWN ]\n[ LOCATION: [REDACTED] ]\n\nTHE SYSTEM IS NOT SAFE.", 
+        lbl = tk.Label(self.current_frame, text="[ IDENTITY VERIFIED: UNKNOWN ]\n[ LOCATION: [REDACTED] ]\n[ COLOR: NONE DETECTED ]\n\nTHE SYSTEM IS NOT SAFE.", 
                        bg=BG_COLOR, fg=FG_COLOR, font=FONT_BOLD, justify="center")
         lbl.pack(expand=True)
         
@@ -177,7 +183,7 @@ class ParanoidUI:
         messagebox.showinfo("NOTICE", "FACE REDACTOR WORKS ADD LOGIC")
         self.clear_main()
         tk.Label(self.current_frame, text=">> MODULE: FACE_REDACTOR.EXE", bg=BG_COLOR, fg=FG_COLOR, font=FONT_BOLD).pack(pady=20)
-        tk.Label(self.current_frame, text="TARGET ACQUISITION: NONE", bg=BG_COLOR, fg="#FF0000", font=FONT_MAIN).pack()
+        tk.Label(self.current_frame, text="TARGET ACQUISITION: NONE ∅", bg=BG_COLOR, fg=FG_COLOR, font=FONT_MAIN).pack()
 
     def composer_ui(self):
         # messagebox.showinfo("NOTICE", "COMPOSER WORKS ADD LOGIC")
@@ -230,7 +236,7 @@ class ParanoidUI:
         meta_display.insert(tk.END, "WAITING FOR INPUT...")
         meta_display.config(state="disabled")
 
-        btn_purge = tk.Button(self.current_frame, text="[ DELETE ALL EVIDENCE ]", bg=BG_COLOR, fg="#FF0000", font=FONT_BOLD, 
+        btn_purge = tk.Button(self.current_frame, text="[ DELETE ALL EVIDENCE ]", bg=FG_COLOR, fg=BG_COLOR, activebackground=BG_COLOR, activeforeground=FG_COLOR, font=FONT_BOLD, 
                               command=lambda: messagebox.showinfo("NOTICE", "MetaRemover WORKS ADD LOGIC"), bd=1, relief="solid")
         btn_purge.pack(pady=10)
 
@@ -279,9 +285,9 @@ class ParanoidUI:
     def glitch_status(self):
         # Make the status bar flicker slightly
         if random.random() < 0.05:
-            self.status_bar.config(bg="#FF0000", text="STATUS: BREACHED // SYSTEM FAILURE IMMINENT")
+            self.status_bar.config(bg=BG_COLOR, fg=FG_COLOR, text="STATUS: BREACHED // THE LOG IS WRITING ITSELF")
         else:
-            self.status_bar.config(bg=FG_COLOR, text=f"STATUS: SECURE // ENCRYPTION: {random.randint(80,99)}% // WATCHING: {'TRUE' if random.random() > 0.5 else 'FALSE'}")
+            self.status_bar.config(bg=FG_COLOR, fg=BG_COLOR, text=f"STATUS: SECURE // ENCRYPTION: {random.randint(80,99)}% // WATCHING: {'TRUE' if random.random() > 0.5 else 'FALSE'}")
         self.root.after(500, self.glitch_status)
 
 if __name__ == "__main__":
