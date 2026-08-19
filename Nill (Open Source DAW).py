@@ -1993,11 +1993,18 @@ class Nill(QMainWindow):
         QMessageBox.warning(self, "Command",
                             "Allowed commands:\nset bpm ___\nsettings\nshow osc\nshow visualizer")
 
+    @staticmethod
+    def _self_invoke(flag: str) -> list:
+        """Re-launch this program with a mode flag. Works frozen (.exe) and unfrozen."""
+        if getattr(sys, "frozen", False):
+            return [sys.executable, flag]
+        return [sys.executable, str(Path(__file__)), flag]
+
     def show_osc(self) -> None:
         if self.osc_process is not None and self.osc_process.poll() is None:
             QMessageBox.information(self, "OSC", "OSC window already running."); return
         try:
-            self.osc_process = subprocess.Popen([sys.executable, str(Path(__file__)), "--nill-osc"])
+            self.osc_process = subprocess.Popen(self._self_invoke("--nill-osc"))
         except Exception as exc:
             QMessageBox.critical(self, "OSC Failed", str(exc))
 
@@ -2006,7 +2013,7 @@ class Nill(QMainWindow):
             QMessageBox.information(self, "Visualizer", "Visualizer already running."); return
         try:
             self.visualizer_process = subprocess.Popen(
-                [sys.executable, str(Path(__file__)), "--nill-visualizer"])
+                self._self_invoke("--nill-visualizer"))
         except Exception as exc:
             QMessageBox.critical(self, "Visualizer Failed", str(exc))
 

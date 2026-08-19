@@ -74,6 +74,28 @@ NILL commands: `settings` · `set bpm ___` · `show osc` · `show visualizer`
 the control room renames itself as `∅ NILL // CONTROL_ROOM`. that is normal.
 nothing here is normal.
 
+## TURNING IT INTO AN APP ∅
+
+the whole suite can be frozen into standalone `.exe` files — no python
+install needed to run them. two ways:
+
+**way 1 — let the cloud do it (no tools needed):**
+github → *Actions* tab → **build apps** → *Run workflow*.
+windows exes appear as artifacts when it finishes. they are greyscale.
+
+**way 2 — build locally (windows / linux / mac):**
+
+```bash
+pip install pyinstaller PySide6 numpy sounddevice pygame mido
+python build_app.py            # NILL.exe + PARANOIA_UI.exe
+python build_app.py --all      # also NILL_SCOPE.exe + SERUM_GHOST.exe
+```
+
+output lands in `dist/`. `NILL.exe` re-launches *itself* with
+`--nill-osc` / `--nill-visualizer` to open the synth and the scope,
+so one exe carries the whole DAW. drop `--windowed` in `build_app.py`
+if you want the console log back — the terminal remembers.
+
 ---
 
 ## LICENSE
