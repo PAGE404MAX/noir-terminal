@@ -74,6 +74,26 @@ NILL commands: `settings` · `set bpm ___` · `show osc` · `show visualizer`
 the control room renames itself as `∅ NILL // CONTROL_ROOM`. that is normal.
 nothing here is normal.
 
+## THE MONOLITH ∅ (one file, compressed)
+
+the entire suite — all four runnable nodes plus every archive file —
+compressed into a single artifact:
+
+```bash
+python MONOLITH.py            # menu: pick a node
+python MONOLITH.py daw        # run NILL ∅ DAW directly (same for paranoia / scope / serum)
+python MONOLITH.py verify     # self-integrity check
+python MONOLITH.py list       # compression manifest
+python MONOLITH.py extract    # write every original file back to disk, byte-identical
+python build_monolith.py      # regenerate after editing sources
+```
+
+compression: best of zlib-9 / bz2-9 / lzma per payload, base85-armored.
+~496KB of source becomes ~129KB embedded (**x3.85**), one file, and
+extraction round-trips **byte-identical**. the monolith forgets nothing.
+`NILL.exe` self-respawn flags (`--nill-osc`, `--nill-visualizer`) pass
+straight through the monolith too.
+
 ## TURNING IT INTO AN APP ∅
 
 the whole suite can be frozen into standalone `.exe` files — no python
